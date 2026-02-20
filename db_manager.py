@@ -2,6 +2,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import re
 import shutil
 import time
 import zipfile
@@ -11,83 +12,136 @@ from config import config
 from database import VectorDB
 
 log = logging.getLogger(__name__)
-TELEGRAM_FILE_LIMIT = 49 * 1024 * 1024
+
+PART_SIZE = 49 * 1024 * 1024  # 49 MB per part (Telegram limit ~50MB)
+
+
+def _safe_filename(text: str) -> str:
+    return re.sub(r'[^\w\-]', '_', text)[:40]
+
+
+def _get_channel_label(db: VectorDB) -> str:
+    channels = db.list_channels()
+    if not channels:
+        return "empty"
+    total = db.count()
+    all_data = db.col.get(limit=min(total, 1), include=["metadatas"])
+    names = set()
+    if all_data["metadatas"]:
+        # get unique channel names from metadata
+        full = db.col.get(limit=total, include=["metadatas"])
+        for m in full["metadatas"]:
+            n = m.get("channel_name", "")
+            if n:
+                names.add(n)
+    if not names:
+        return "channels_" + "_".join(channels.keys())
+    return "_".join(_safe_filename(n) for n in sorted(names))
 
 
 def get_db_size_mb() -> float:
-    chroma_path = Path(config.CHROMA_DIR)
-    if not chroma_path.exists():
+    p = Path(config.CHROMA_DIR)
+    if not p.exists():
         return 0
-    total = 0
-    for f in chroma_path.rglob("*"):
-        if f.is_file():
-            total += f.stat().st_size
-    return total / 1024 / 1024
+    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) / 1024 / 1024
 
 
-def export_db() -> tuple[bytes, dict]:
-    chroma_path = Path(config.CHROMA_DIR)
-    if not chroma_path.exists():
+def _create_zip() -> bytes:
+    chroma = Path(config.CHROMA_DIR)
+    if not chroma.exists():
         raise RuntimeError("No database found.")
     buf = io.BytesIO()
-    file_count = 0
-    total_size = 0
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in sorted(chroma_path.rglob("*")):
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        for f in sorted(chroma.rglob("*")):
             if f.is_file():
-                arcname = str(f.relative_to(chroma_path.parent))
-                zf.write(f, arcname)
-                file_count += 1
-                total_size += f.stat().st_size
-    zip_bytes = buf.getvalue()
-    if len(zip_bytes) > TELEGRAM_FILE_LIMIT:
-        raise RuntimeError(
-            f"Database too large for Telegram "
-            f"({len(zip_bytes) // 1024 // 1024} MB). "
-            f"Use: tar czf backup.tar.gz chroma_db/"
-        )
-    return zip_bytes, {
-        "files": file_count,
-        "raw_size_mb": round(total_size / 1024 / 1024, 1),
-        "zip_size_mb": round(len(zip_bytes) / 1024 / 1024, 1),
+                zf.write(f, str(f.relative_to(chroma.parent)))
+    return buf.getvalue()
+
+
+def export_db(db: VectorDB) -> list[tuple[bytes, str, dict]]:
+    """
+    Export database as zip.
+    Returns list of (bytes, filename, stats).
+    Single item if <49MB, multiple parts if larger.
+    """
+    zip_bytes = _create_zip()
+    label = _get_channel_label(db)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    raw_mb = get_db_size_mb()
+    zip_mb = len(zip_bytes) / 1024 / 1024
+    vectors = db.count()
+
+    stats = {
+        "vectors": vectors,
+        "raw_mb": round(raw_mb, 1),
+        "zip_mb": round(zip_mb, 1),
+        "channels": label,
     }
+
+    if len(zip_bytes) <= PART_SIZE:
+        name = f"backup_{label}_{ts}.zip"
+        return [(zip_bytes, name, stats)]
+
+    # split into parts
+    parts = []
+    total = len(zip_bytes)
+    num_parts = (total + PART_SIZE - 1) // PART_SIZE
+    stats["parts"] = num_parts
+
+    for i in range(num_parts):
+        start = i * PART_SIZE
+        chunk = zip_bytes[start:start + PART_SIZE]
+        pname = f"backup_{label}_{ts}.part{i + 1:02d}of{num_parts:02d}"
+        parts.append((chunk, pname, stats))
+
+    return parts
 
 
 def import_db(zip_bytes: bytes) -> dict:
-    chroma_path = Path(config.CHROMA_DIR)
-    backup_path = Path(config.CHROMA_DIR + f"_backup_{int(time.time())}")
+    """Import from single zip."""
+    chroma = Path(config.CHROMA_DIR)
+    backup = Path(config.CHROMA_DIR + f"_bak_{int(time.time())}")
+
     try:
         buf = io.BytesIO(zip_bytes)
         with zipfile.ZipFile(buf, "r") as zf:
             names = zf.namelist()
             if not names:
-                raise RuntimeError("Empty zip file.")
+                raise RuntimeError("Empty zip.")
             if not any("chroma" in n.lower() for n in names):
                 raise RuntimeError("Not a ChromaDB backup.")
     except zipfile.BadZipFile:
         raise RuntimeError("Invalid zip file.")
-    if chroma_path.exists():
-        shutil.move(str(chroma_path), str(backup_path))
+
+    if chroma.exists():
+        shutil.move(str(chroma), str(backup))
+
     try:
         buf = io.BytesIO(zip_bytes)
         with zipfile.ZipFile(buf, "r") as zf:
-            zf.extractall(chroma_path.parent)
+            zf.extractall(chroma.parent)
         db = VectorDB()
         count = db.count()
         channels = db.list_channels()
-        if backup_path.exists():
-            shutil.rmtree(str(backup_path))
+        if backup.exists():
+            shutil.rmtree(str(backup))
         return {"vectors": count, "channels": len(channels), "success": True}
     except Exception as exc:
-        if chroma_path.exists():
-            shutil.rmtree(str(chroma_path))
-        if backup_path.exists():
-            shutil.move(str(backup_path), str(chroma_path))
-        raise RuntimeError(f"Import failed (backup restored): {exc}")
+        if chroma.exists():
+            shutil.rmtree(str(chroma))
+        if backup.exists():
+            shutil.move(str(backup), str(chroma))
+        raise RuntimeError(f"Failed (restored backup): {exc}")
+
+
+def import_db_parts(parts: list[bytes]) -> dict:
+    """Import from multiple parts (reassemble then import)."""
+    combined = b"".join(parts)
+    return import_db(combined)
 
 
 class DuplicateFinder:
-    def __init__(self, db: VectorDB) -> None:
+    def __init__(self, db: VectorDB):
         self.db = db
 
     def find_all(self, threshold=0.95, page_size=100, progress_callback=None):
