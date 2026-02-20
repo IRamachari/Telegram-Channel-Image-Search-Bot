@@ -4,7 +4,6 @@ import logging
 from pathlib import Path
 
 import chromadb
-
 from config import config
 
 log = logging.getLogger(__name__)
@@ -19,7 +18,7 @@ class VectorDB:
             name=config.COLLECTION,
             metadata={"hnsw:space": "cosine"},
         )
-        log.info("ChromaDB ready  (%s vectors)", self.col.count())
+        log.info("ChromaDB ready (%s vectors)", self.col.count())
 
     def upsert(self, ids, embeddings, metadatas):
         self.col.upsert(ids=ids, embeddings=embeddings, metadatas=metadatas)
@@ -33,6 +32,33 @@ class VectorDB:
 
     def count(self):
         return self.col.count()
+
+    def delete(self, ids: list[str]):
+        if ids:
+            self.col.delete(ids=ids)
+
+    def get_all_ids(self) -> list[str]:
+        total = self.col.count()
+        if total == 0:
+            return []
+        return self.col.get(limit=total)["ids"]
+
+    def get_ids_for_channel(self, channel_id: int) -> list[dict]:
+        total = self.col.count()
+        if total == 0:
+            return []
+        data = self.col.get(
+            where={"channel_id": channel_id},
+            limit=total,
+            include=["metadatas"],
+        )
+        results = []
+        for i, doc_id in enumerate(data["ids"]):
+            results.append({
+                "id": doc_id,
+                "message_id": data["metadatas"][i].get("message_id", 0),
+            })
+        return results
 
     def _load_state(self):
         if _STATE_FILE.exists():
