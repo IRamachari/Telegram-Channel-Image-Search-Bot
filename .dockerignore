@@ -1,0 +1,14 @@
+.env
+*.session
+*.session-journal
+__pycache__/
+*.pyc
+.git/
+.gitignore
+venv/
+chroma_db/
+temp_images/
+.DS_Store
+*.md
+.vscode/
+.idea/
