@@ -18,7 +18,6 @@ from database import VectorDB
 from embeddings import CLIPEmbedder
 
 log = logging.getLogger(__name__)
-
 MIN_PHOTO_SIZE = 224
 
 try:
@@ -64,13 +63,10 @@ def session_exists():
 
 
 def session_info():
-    path = config.SESSION_FILE
-    return {
-        "path": path,
-        "exists": os.path.exists(path),
-        "size": os.path.getsize(path) if os.path.exists(path) else 0,
-        "cwd": os.getcwd(),
-    }
+    p = config.SESSION_FILE
+    return {"path": p, "exists": os.path.exists(p),
+            "size": os.path.getsize(p) if os.path.exists(p) else 0,
+            "cwd": os.getcwd()}
 
 
 def _make_client():
@@ -80,21 +76,21 @@ def _make_client():
 async def check_session():
     if not session_exists():
         return False, f"Not found: {config.SESSION_FILE}"
-    client = _make_client()
+    c = _make_client()
     try:
-        await client.connect()
-        if await client.is_user_authorized():
-            me = await client.get_me()
-            await client.disconnect()
+        await c.connect()
+        if await c.is_user_authorized():
+            me = await c.get_me()
+            await c.disconnect()
             return True, f"Logged in as {me.first_name} (ID: {me.id})"
-        await client.disconnect()
-        return False, "Session expired. /login again."
-    except Exception as exc:
+        await c.disconnect()
+        return False, "Expired. /login again."
+    except Exception as e:
         try:
-            await client.disconnect()
+            await c.disconnect()
         except Exception:
             pass
-        return False, f"Error: {exc}"
+        return False, f"Error: {e}"
 
 
 def _is_image(msg):
@@ -103,16 +99,16 @@ def _is_image(msg):
     if isinstance(msg.media, MessageMediaPhoto):
         return True
     if isinstance(msg.media, MessageMediaDocument):
-        doc = msg.media.document
-        return doc and getattr(doc, "mime_type", "").startswith("image/")
+        d = msg.media.document
+        return d and getattr(d, "mime_type", "").startswith("image/")
     return False
 
 
 def _get_media_size(msg):
     if isinstance(msg.media, MessageMediaPhoto):
-        photo = msg.media.photo
-        if photo and photo.sizes:
-            for s in reversed(photo.sizes):
+        p = msg.media.photo
+        if p and p.sizes:
+            for s in reversed(p.sizes):
                 sz = getattr(s, "size", None)
                 if sz:
                     return sz
@@ -121,19 +117,19 @@ def _get_media_size(msg):
                     return max(szs)
         return 100000
     if isinstance(msg.media, MessageMediaDocument):
-        doc = msg.media.document
-        return doc.size if doc else 500000
+        d = msg.media.document
+        return d.size if d else 500000
     return 100000
 
 
 def _pick_photo_size(msg):
     if not isinstance(msg.media, MessageMediaPhoto):
         return None
-    photo = msg.media.photo
-    if not photo or not photo.sizes:
+    p = msg.media.photo
+    if not p or not p.sizes:
         return None
     usable = []
-    for s in photo.sizes:
+    for s in p.sizes:
         if isinstance(s, (PhotoStrippedSize, PhotoCachedSize)):
             continue
         if isinstance(s, PhotoSizeProgressive):
@@ -147,15 +143,15 @@ def _pick_photo_size(msg):
     if not usable:
         return None
     usable.sort(key=lambda x: x[1])
-    for typ, sz in usable:
+    for t, sz in usable:
         if sz >= MIN_PHOTO_SIZE:
-            return typ
+            return t
     return usable[-1][0]
 
 
-def _msg_link(entity, msg_id):
+def _msg_link(entity, mid):
     u = getattr(entity, "username", None)
-    return f"https://t.me/{u}/{msg_id}" if u else f"https://t.me/c/{entity.id}/{msg_id}"
+    return f"https://t.me/{u}/{mid}" if u else f"https://t.me/c/{entity.id}/{mid}"
 
 
 def _channel_display(entity):
@@ -178,9 +174,7 @@ async def resolve_channel(client, ch):
         return await client.get_entity(int(text))
     if "t.me/" in text:
         slug = text.rstrip("/").split("/")[-1]
-        if slug.startswith("+"):
-            return await client.get_entity(text)
-        return await client.get_entity(slug)
+        return await client.get_entity(text) if slug.startswith("+") else await client.get_entity(slug)
     return await client.get_entity(text)
 
 
@@ -216,30 +210,30 @@ class ChannelIndexer:
         Path(config.TEMP_DIR).mkdir(parents=True, exist_ok=True)
 
     async def estimate_channel(self, channel_input):
-        client = _make_client()
-        await client.connect()
-        if not await client.is_user_authorized():
-            await client.disconnect()
+        c = _make_client()
+        await c.connect()
+        if not await c.is_user_authorized():
+            await c.disconnect()
             raise RuntimeError("Session expired.")
         try:
-            entity = await resolve_channel(client, channel_input)
-            msgs = await client.get_messages(entity, limit=0)
+            e = await resolve_channel(c, channel_input)
+            msgs = await c.get_messages(e, limit=0)
             total = msgs.total
             sample = min(200, total)
             photos = 0
-            total_size = 0
+            tsize = 0
             if sample > 0:
-                async for m in client.iter_messages(entity, limit=sample):
+                async for m in c.iter_messages(e, limit=sample):
                     if _is_image(m):
                         photos += 1
-                        total_size += _get_media_size(m)
+                        tsize += _get_media_size(m)
             ratio = photos / sample if sample > 0 else 0
             est = int(total * ratio)
-            avg = total_size / photos if photos > 0 else 100000
+            avg = tsize / photos if photos > 0 else 100000
             return {
-                "channel_name": _channel_display(entity),
-                "is_private": getattr(entity, "username", None) is None,
-                "restricted": _is_restricted(entity),
+                "channel_name": _channel_display(e),
+                "is_private": getattr(e, "username", None) is None,
+                "restricted": _is_restricted(e),
                 "total_messages": total,
                 "sample_size": sample,
                 "sample_photos": photos,
@@ -247,27 +241,27 @@ class ChannelIndexer:
                 "estimated_photos": est,
                 "avg_photo_kb": round(avg / 1024, 1),
                 "estimated_download_mb": round(est * avg / 1024 / 1024, 1),
-                "watermark": self.db.get_watermark(entity.id),
+                "watermark": self.db.get_watermark(e.id),
             }
         finally:
-            await client.disconnect()
+            await c.disconnect()
 
     async def index_channel(self, channel_input, limit=None, progress_callback=None, concurrency=None):
         if not session_exists():
             raise RuntimeError("No session. /login first.")
         if concurrency is None:
             concurrency = _get_parallel()
-        client = _make_client()
-        await client.connect()
-        if not await client.is_user_authorized():
-            await client.disconnect()
+        c = _make_client()
+        await c.connect()
+        if not await c.is_user_authorized():
+            await c.disconnect()
             raise RuntimeError("Session expired.")
         try:
-            entity = await resolve_channel(client, channel_input)
-            return await self._fast_index(client, entity, limit, progress_callback, concurrency)
+            e = await resolve_channel(c, channel_input)
+            return await self._fast_index(c, e, limit, progress_callback, concurrency)
         finally:
             try:
-                await client.disconnect()
+                await c.disconnect()
             except Exception:
                 pass
 
@@ -275,30 +269,26 @@ class ChannelIndexer:
         ch_id = entity.id
         wm = self.db.get_watermark(ch_id)
         actual_batch = _get_batch_size()
-        current_concurrency = min(concurrency, 8)
-        min_c = 3
-        max_c = concurrency
-        flood_window = [0]
-        clean_batches = [0]
+        cur_c = min(concurrency, 8)
+        min_c, max_c = 3, concurrency
+        flood_w, clean_b = [0], [0]
 
-        log.info("FAST INDEX: %s | max=%d start=%d batch=%d cryptg=%s wm=%s",
-                 _channel_display(entity), max_c, current_concurrency,
-                 actual_batch, HAS_CRYPTG, wm)
+        log.info("INDEX: %s max=%d start=%d batch=%d wm=%s",
+                 _channel_display(entity), max_c, cur_c, actual_batch, wm)
 
         stats = IndexStats()
-        sem = asyncio.Semaphore(current_concurrency)
-        embed_queue: asyncio.Queue = asyncio.Queue(maxsize=actual_batch * 5)
+        sem = asyncio.Semaphore(cur_c)
+        eq: asyncio.Queue = asyncio.Queue(maxsize=actual_batch * 5)
 
         async def update_sem(n):
-            nonlocal sem, current_concurrency
-            if n != current_concurrency:
-                current_concurrency = n
-                sem = asyncio.Semaphore(current_concurrency)
-                log.info("Concurrency → %d", n)
+            nonlocal sem, cur_c
+            if n != cur_c:
+                cur_c = n
+                sem = asyncio.Semaphore(cur_c)
 
-        async def download_one(msg):
-            doc_id = f"{ch_id}_{msg.id}"
-            tmp = os.path.join(config.TEMP_DIR, f"{doc_id}.jpg")
+        async def dl_one(msg):
+            did = f"{ch_id}_{msg.id}"
+            tmp = os.path.join(config.TEMP_DIR, f"{did}.jpg")
             meta = {
                 "channel_id": ch_id,
                 "channel_name": getattr(entity, "title", str(ch_id)),
@@ -317,9 +307,9 @@ class ChannelIndexer:
                     stats.normal_downloads += 1
                 except FloodWaitError as e:
                     stats.flood_waits += 1
-                    flood_window[0] += 1
-                    clean_batches[0] = 0
-                    await update_sem(max(min_c, current_concurrency - 2))
+                    flood_w[0] += 1
+                    clean_b[0] = 0
+                    await update_sem(max(min_c, cur_c - 2))
                     await asyncio.sleep(min(e.seconds, 30))
                     try:
                         await msg.download_media(file=tmp)
@@ -336,106 +326,104 @@ class ChannelIndexer:
                     return
                 stats.downloaded += 1
                 stats.bytes_downloaded += os.path.getsize(tmp)
-                await embed_queue.put((doc_id, tmp, meta))
+                await eq.put((did, tmp, meta))
 
         async def producer():
             tasks = []
-            batch_n = 0
+            bn = 0
             try:
                 async for msg in client.iter_messages(entity, limit=limit, min_id=wm, reverse=True):
                     if not _is_image(msg):
                         continue
-                    tasks.append(asyncio.create_task(download_one(msg)))
-                    if len(tasks) >= current_concurrency * 2:
-                        _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                        tasks = list(pending)
-                        batch_n += 1
-                        if batch_n % 5 == 0:
-                            if flood_window[0] == 0:
-                                clean_batches[0] += 1
-                                if clean_batches[0] >= 3:
-                                    await update_sem(min(max_c, current_concurrency + 1))
-                                    clean_batches[0] = 0
-                            flood_window[0] = 0
+                    tasks.append(asyncio.create_task(dl_one(msg)))
+                    if len(tasks) >= cur_c * 2:
+                        _, p = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                        tasks = list(p)
+                        bn += 1
+                        if bn % 5 == 0:
+                            if flood_w[0] == 0:
+                                clean_b[0] += 1
+                                if clean_b[0] >= 3:
+                                    await update_sem(min(max_c, cur_c + 1))
+                                    clean_b[0] = 0
+                            flood_w[0] = 0
                         await asyncio.sleep(0.1)
             except FloodWaitError as e:
                 stats.flood_waits += 1
-                await update_sem(max(min_c, current_concurrency - 3))
+                await update_sem(max(min_c, cur_c - 3))
                 await asyncio.sleep(min(e.seconds, 60))
             except Exception as exc:
                 log.error("Producer: %s", exc, exc_info=True)
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
-            await embed_queue.put(None)
+            await eq.put(None)
 
         async def consumer():
-            bids, bpaths, bmeta = [], [], []
+            bi, bp, bm = [], [], []
             while True:
                 try:
-                    item = await asyncio.wait_for(embed_queue.get(), timeout=300)
+                    item = await asyncio.wait_for(eq.get(), timeout=300)
                 except asyncio.TimeoutError:
-                    log.error("Consumer timeout")
                     break
                 if item is None:
-                    if bpaths:
-                        n = await asyncio.to_thread(self._flush, bids, bpaths, bmeta)
+                    if bp:
+                        n = await asyncio.to_thread(self._flush, bi, bp, bm)
                         stats.embedded += n
-                        if bmeta:
-                            self.db.set_watermark(ch_id, max(m["message_id"] for m in bmeta))
+                        if bm:
+                            self.db.set_watermark(ch_id, max(m["message_id"] for m in bm))
                         if progress_cb:
                             try:
                                 await progress_cb(stats)
                             except Exception:
                                 pass
                     break
-                did, tmp, meta = item
-                bids.append(did)
-                bpaths.append(tmp)
-                bmeta.append(meta)
-                if len(bpaths) >= actual_batch:
-                    n = await asyncio.to_thread(self._flush, bids, bpaths, bmeta)
+                di, tp, mt = item
+                bi.append(di)
+                bp.append(tp)
+                bm.append(mt)
+                if len(bp) >= actual_batch:
+                    n = await asyncio.to_thread(self._flush, bi, bp, bm)
                     stats.embedded += n
-                    self.db.set_watermark(ch_id, max(m["message_id"] for m in bmeta))
-                    log.info("  +%d | total=%d | %.1f/s | %.1fMB | %ds | c=%d",
+                    self.db.set_watermark(ch_id, max(m["message_id"] for m in bm))
+                    log.info("  +%d total=%d %.1f/s %.1fMB %ds c=%d",
                              n, stats.embedded, stats.speed, stats.mb_downloaded,
-                             stats.elapsed, current_concurrency)
+                             stats.elapsed, cur_c)
                     if progress_cb:
                         try:
                             await progress_cb(stats)
                         except Exception:
                             pass
-                    bids, bpaths, bmeta = [], [], []
+                    bi, bp, bm = [], [], []
 
-        async def heartbeat():
+        async def hb():
             while True:
                 await asyncio.sleep(15)
-                log.info("  heartbeat | dl=%d emb=%d err=%d flood=%d c=%d",
-                         stats.downloaded, stats.embedded, stats.errors,
-                         stats.flood_waits, current_concurrency)
+                log.info("  hb dl=%d emb=%d err=%d c=%d",
+                         stats.downloaded, stats.embedded, stats.errors, cur_c)
 
         p = asyncio.create_task(producer())
         c = asyncio.create_task(consumer())
-        h = asyncio.create_task(heartbeat())
+        h = asyncio.create_task(hb())
         await asyncio.gather(p, c, return_exceptions=True)
         h.cancel()
-        log.info("DONE | emb=%d skip=%d err=%d flood=%d | %.1fMB | %.1f/s | %ds | DB=%d",
+        log.info("DONE emb=%d skip=%d err=%d flood=%d %.1fMB %.1f/s %ds DB=%d",
                  stats.embedded, stats.skipped, stats.errors, stats.flood_waits,
                  stats.mb_downloaded, stats.speed, stats.elapsed, self.db.count())
         return stats.embedded
 
     def _flush(self, ids, paths, metas):
         embs = self.embedder.embed_batch(paths)
-        ok_ids, ok_embs, ok_meta = [], [], []
+        oi, oe, om = [], [], []
         for i, emb in enumerate(embs):
             if emb is not None:
-                ok_ids.append(ids[i])
-                ok_embs.append(emb)
-                ok_meta.append(metas[i])
-        if ok_ids:
-            self.db.upsert(ok_ids, ok_embs, ok_meta)
+                oi.append(ids[i])
+                oe.append(emb)
+                om.append(metas[i])
+        if oi:
+            self.db.upsert(oi, oe, om)
         for p in paths:
             try:
                 os.remove(p)
             except OSError:
                 pass
-        return len(ok_ids)
+        return len(oi)
