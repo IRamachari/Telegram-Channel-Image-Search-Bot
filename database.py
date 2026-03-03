@@ -12,7 +12,23 @@ _STATE_FILE = Path(config.CHROMA_DIR) / "indexing_state.json"
 
 class VectorDB:
     def __init__(self) -> None:
+        import sqlite3
         Path(config.CHROMA_DIR).mkdir(parents=True, exist_ok=True)
+
+        # Apply WAL mode + busy timeout BEFORE ChromaDB opens the file.
+        # This makes SQLite retry for up to 30 s instead of immediately raising
+        # "database is locked" when two coroutines hit the DB at the same time.
+        db_path = Path(config.CHROMA_DIR) / "chroma.sqlite3"
+        if db_path.exists():
+            try:
+                con = sqlite3.connect(str(db_path), timeout=30)
+                con.execute("PRAGMA journal_mode=WAL;")
+                con.execute("PRAGMA busy_timeout=30000;")
+                con.commit()
+                con.close()
+            except Exception as _e:
+                log.debug("SQLite pragma setup: %s", _e)
+
         self.client = chromadb.PersistentClient(path=config.CHROMA_DIR)
         self.col = self.client.get_or_create_collection(
             name=config.COLLECTION,

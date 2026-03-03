@@ -42,9 +42,13 @@ def _msg_link(entity, msg_id):
 
 
 class ChannelMonitor:
-    def __init__(self, db: VectorDB, embedder: CLIPEmbedder) -> None:
+    def __init__(self, db: VectorDB, embedder: CLIPEmbedder,
+                 db_lock: asyncio.Lock | None = None) -> None:
         self.db = db
         self.embedder = embedder
+        # Shared write lock — passed from SearchBot so the monitor, indexer,
+        # and cleanup never hit ChromaDB/SQLite concurrently.
+        self._db_lock: asyncio.Lock = db_lock or asyncio.Lock()
         self.client: TelegramClient | None = None
         self.running = False
         self._watch_ids: set[int] = set()
@@ -63,8 +67,8 @@ class ChannelMonitor:
     async def start(self, notify_callback=None) -> str:
         """
         Start monitoring all indexed channels.
-        notify_callback(text) called on events.
-        Returns status message.
+        notify_callback(text) is called on new/deleted events.
+        Returns a status message.
         """
         if self.running:
             return "Already running."
@@ -102,12 +106,10 @@ class ChannelMonitor:
             await self.client.disconnect()
             return "No channels could be resolved."
 
-        # register new message handler
         @self.client.on(events.NewMessage(chats=list(self._watch_ids)))
         async def on_new(event):
             await self._handle_new(event)
 
-        # register raw update handler for deletions
         @self.client.on(events.Raw(types=[UpdateDeleteChannelMessages]))
         async def on_delete(event):
             await self._handle_delete(event)
@@ -118,7 +120,6 @@ class ChannelMonitor:
         names = ", ".join(ch_names.values())
         log.info("Monitor started for: %s", names)
 
-        # keep client running in background
         asyncio.create_task(self._keep_alive())
 
         return f"✅ Monitoring {len(self._watch_ids)} channels:\n{names}"
@@ -153,11 +154,10 @@ class ChannelMonitor:
         )
 
     async def _handle_new(self, event):
-        """Auto-embed new images."""
+        """Auto-embed new images — serialised via _db_lock."""
         msg = event.message
         if not _is_image(msg):
             return
-
         if not self.embedder.is_ready():
             return
 
@@ -185,12 +185,15 @@ class ChannelMonitor:
                 "private": getattr(entity, "username", None) is None,
             }
 
-            self.db.upsert([doc_id], [emb], [meta])
-            self.db.set_watermark(ch_id, max(
-                self.db.get_watermark(ch_id), msg.id,
-            ))
-            self._stats["new_images"] += 1
+            # ── serialised write ──────────────────────────────────────────────
+            async with self._db_lock:
+                self.db.upsert([doc_id], [emb], [meta])
+                self.db.set_watermark(ch_id, max(
+                    self.db.get_watermark(ch_id), msg.id,
+                ))
+            # ─────────────────────────────────────────────────────────────────
 
+            self._stats["new_images"] += 1
             log.info("Monitor: +1 image from %s (msg %d)",
                      getattr(entity, "title", ch_id), msg.id)
 
@@ -212,7 +215,7 @@ class ChannelMonitor:
                 os.remove(tmp)
 
     async def _handle_delete(self, event):
-        """Remove vectors for deleted messages."""
+        """Remove vectors for deleted messages — serialised via _db_lock."""
         if not hasattr(event, "channel_id") or not hasattr(event, "messages"):
             return
 
@@ -220,14 +223,15 @@ class ChannelMonitor:
         if ch_id not in self._watch_ids:
             return
 
-        deleted_ids = []
-        for msg_id in event.messages:
-            doc_id = f"{ch_id}_{msg_id}"
-            deleted_ids.append(doc_id)
+        deleted_ids = [f"{ch_id}_{msg_id}" for msg_id in event.messages]
 
         if deleted_ids:
             try:
-                self.db.delete(deleted_ids)
+                # ── serialised write ──────────────────────────────────────────
+                async with self._db_lock:
+                    self.db.delete(deleted_ids)
+                # ─────────────────────────────────────────────────────────────
+
                 self._stats["deleted_images"] += len(deleted_ids)
                 log.info("Monitor: -%d vectors (channel %d)",
                          len(deleted_ids), ch_id)
@@ -265,27 +269,23 @@ class ChannelMonitor:
             indexed = self.db.get_ids_for_channel(ch_id)
             if not indexed:
                 await client.disconnect()
-                return {"channel": ch_name, "checked": 0, "removed": 0}
+                return {"channel": ch_name, "checked": 0, "removed": 0,
+                        "remaining": self.db.count()}
 
             to_delete = []
             checked = 0
             batch_size = 100
 
-            # check in batches
             msg_ids = [item["message_id"] for item in indexed]
             doc_ids = {item["message_id"]: item["id"] for item in indexed}
 
             for i in range(0, len(msg_ids), batch_size):
                 batch = msg_ids[i:i + batch_size]
                 try:
-                    # get_messages returns None for deleted ones
-                    messages = await client.get_messages(
-                        entity, ids=batch,
-                    )
+                    messages = await client.get_messages(entity, ids=batch)
                     for j, msg in enumerate(messages):
                         mid = batch[j]
                         if msg is None:
-                            # message deleted
                             did = doc_ids.get(mid)
                             if did:
                                 to_delete.append(did)
@@ -297,7 +297,10 @@ class ChannelMonitor:
                     await progress_callback(checked, len(msg_ids), len(to_delete))
 
             if to_delete:
-                self.db.delete(to_delete)
+                # ── serialised write ──────────────────────────────────────────
+                async with self._db_lock:
+                    self.db.delete(to_delete)
+                # ─────────────────────────────────────────────────────────────
                 log.info("Cleanup: removed %d from %s", len(to_delete), ch_name)
 
             return {

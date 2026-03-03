@@ -3,6 +3,7 @@ import asyncio
 import io as io_module
 import logging
 import time
+from datetime import datetime
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove,
@@ -20,6 +21,7 @@ from embeddings import CLIPEmbedder
 from searcher import ImageSearcher
 import models
 import system_info
+import state as _state
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +64,28 @@ async def _edit(msg, text, **kw):
         pass
 
 
+def _status_text(db: VectorDB, monitor, new_images=None, removed_images=None, errors=None) -> str:
+    """Build the live status block for the pinned message."""
+    n = db.count()
+    ch = db.list_channels()
+    mon = "✅ Running" if monitor and monitor.running else "⏹ Off"
+    st = monitor.stats if monitor else {"new_images": 0, "deleted_images": 0, "errors": 0}
+    ni = new_images if new_images is not None else st["new_images"]
+    ri = removed_images if removed_images is not None else st["deleted_images"]
+    er = errors if errors is not None else st["errors"]
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return (
+        f"📊 *Image Search Bot — Live Status*\n\n"
+        f"🗄 Indexed: *{n:,}* images\n"
+        f"📡 Channels: *{len(ch)}*\n"
+        f"🔄 Monitor: {mon}\n"
+        f"📸 New since start: *{ni}*\n"
+        f"🗑 Removed since start: *{ri}*\n"
+        f"❌ Errors: *{er}*\n"
+        f"🕐 `{ts}`"
+    )
+
+
 class SearchBot:
     def __init__(self):
         log.info("Initialising …")
@@ -72,13 +96,122 @@ class SearchBot:
         self._dup_cache: dict[int, list] = {}
         self._monitor = None
         self._import_parts: dict[int, list[bytes]] = {}
+        self._app: Application | None = None
+        # Pinned message registry persisted across restarts: {str(chat_id): message_id}
+        self._pinned: dict[str, int] = _state.get("pinned", {})
+        # Serialise ALL ChromaDB writes — prevents "database is locked" errors
+        self._db_lock: asyncio.Lock = asyncio.Lock()
 
     def _track(self, coro):
         t = asyncio.create_task(coro)
         self._tasks.add(t)
         t.add_done_callback(self._tasks.discard)
 
-    # ── /start ──
+    # ── Startup hook ──────────────────────────────────────────────────────────
+
+    async def _on_startup(self, app: Application) -> None:
+        """
+        Called automatically after the bot connects.
+          1. Starts the channel monitor (always-on).
+          2. Syncs any images added while the bot was offline.
+          3. Notifies admin chat and updates the pinned message.
+        """
+        self._app = app
+        log.info("Startup: checking prerequisites …")
+
+        from indexer import session_exists
+        if not session_exists():
+            log.info("Startup: no session — skipping auto-monitor/sync.")
+            return
+        if not self.embedder.is_ready():
+            log.info("Startup: model not ready — skipping auto-monitor/sync.")
+            return
+        if self.db.count() == 0:
+            log.info("Startup: DB empty — skipping auto-monitor/sync.")
+            return
+
+        admin_chat = config.ADMIN_IDS[0] if config.ADMIN_IDS else None
+
+        # 1. Startup sync FIRST — then start monitor so they don't collide
+        channels = self.db.list_channels()
+        log.info("Startup sync: %d channel(s) …", len(channels))
+        total_new = await self._sync_channels(list(channels.keys()))
+        log.info("Startup sync done: +%d new image(s)", total_new)
+
+        # 2. Start monitor (after sync so initial write burst is done)
+        from monitor import ChannelMonitor
+        self._monitor = ChannelMonitor(self.db, self.embedder, db_lock=self._db_lock)
+
+        async def notify(text: str) -> None:
+            if admin_chat:
+                try:
+                    await app.bot.send_message(admin_chat, text, parse_mode="Markdown")
+                except Exception:
+                    pass
+            await self._update_pinned_message(app.bot)
+
+        result = await self._monitor.start(notify_callback=notify)
+        log.info("Auto-monitor: %s", result)
+
+        # 3. Notify admin
+        if admin_chat:
+            try:
+                if total_new > 0:
+                    await app.bot.send_message(
+                        admin_chat,
+                        f"🔄 *Startup sync complete\\!*\n"
+                        f"📸 *{total_new}* new image(s) indexed while offline\n"
+                        f"📊 Total DB: *{self.db.count():,}*",
+                        parse_mode="Markdown",
+                    )
+                else:
+                    await app.bot.send_message(
+                        admin_chat,
+                        f"✅ *Bot started* — monitor active, DB up to date\\.\n"
+                        f"📊 Total: *{self.db.count():,}* image(s)",
+                        parse_mode="Markdown",
+                    )
+            except Exception as e:
+                log.debug("Startup notify error: %s", e)
+
+        await self._update_pinned_message(app.bot)
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    async def _sync_channels(self, channel_ids: list) -> int:
+        """Index images newer than the stored watermark for each channel."""
+        total = 0
+        for ch_id_str in channel_ids:
+            try:
+                from indexer import ChannelIndexer
+                # Serialise: one channel at a time, using the shared write lock
+                async with self._db_lock:
+                    count = await ChannelIndexer(self.db, self.embedder).index_channel(
+                        int(ch_id_str), limit=None, progress_callback=None,
+                    )
+                total += count
+            except Exception as e:
+                log.error("Sync channel %s: %s", ch_id_str, e)
+        return total
+
+    async def _update_pinned_message(self, bot) -> None:
+        """Edit the pinned status message in every registered chat."""
+        if not self._pinned:
+            return
+        text = _status_text(self.db, self._monitor)
+        for chat_id_str, msg_id in list(self._pinned.items()):
+            try:
+                await bot.edit_message_text(
+                    chat_id=int(chat_id_str),
+                    message_id=msg_id,
+                    text=text,
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                log.debug("Pinned update [%s]: %s", chat_id_str, e)
+
+    # ── /start ────────────────────────────────────────────────────────────────
+
     async def cmd_start(self, update: Update, _):
         from indexer import session_exists
         s = "✅" if session_exists() else "❌ → /login"
@@ -93,7 +226,9 @@ class SearchBot:
             f"*Setup:* /login → /model → /index\n"
             f"*Search:* Send photo\n\n"
             f"*Tools:*\n"
-            f"/monitor — auto\\-detect new/deleted\n"
+            f"/monitor — monitor status / toggle\n"
+            f"/checkupdates — sync new images now\n"
+            f"/setpinned — pin live status message\n"
             f"/cleanup — remove deleted vectors\n"
             f"/duplicates — find duplicates\n"
             f"/export — download DB\n"
@@ -104,7 +239,8 @@ class SearchBot:
             parse_mode="Markdown",
         )
 
-    # ── /session ──
+    # ── /session ──────────────────────────────────────────────────────────────
+
     async def cmd_session(self, update: Update, _):
         if not _admin(update.effective_user.id):
             return await update.message.reply_text("⛔")
@@ -117,7 +253,8 @@ class SearchBot:
             parse_mode="Markdown",
         )
 
-    # ── /stats ──
+    # ── /stats ────────────────────────────────────────────────────────────────
+
     async def cmd_stats(self, update: Update, _):
         n = self.db.count()
         ch = self.db.list_channels()
@@ -128,7 +265,8 @@ class SearchBot:
             lines.append("  No channels.")
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-    # ── /system ──
+    # ── /system ───────────────────────────────────────────────────────────────
+
     async def cmd_system(self, update: Update, _):
         if not _admin(update.effective_user.id):
             return await update.message.reply_text("⛔")
@@ -141,7 +279,8 @@ class SearchBot:
                  f"🔄 Tasks: {len(self._tasks)} | Monitor: {mon}\n")
         await update.message.reply_text(text, parse_mode="Markdown")
 
-    # ── /autotune ──
+    # ── /autotune ─────────────────────────────────────────────────────────────
+
     async def cmd_autotune(self, update: Update, _):
         if not _admin(update.effective_user.id):
             return await update.message.reply_text("⛔")
@@ -150,7 +289,8 @@ class SearchBot:
         text = await asyncio.to_thread(format_auto_tune, self.embedder.model_size_mb)
         await update.message.reply_text(text + "\n✅ _Applied\\._", parse_mode="Markdown")
 
-    # ── /cancel ──
+    # ── /cancel ───────────────────────────────────────────────────────────────
+
     async def cmd_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cl = ctx.user_data.pop("tg_client", None)
         if cl:
@@ -162,7 +302,8 @@ class SearchBot:
         await update.message.reply_text("Cancelled.", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
 
-    # ── /login ──
+    # ── /login ────────────────────────────────────────────────────────────────
+
     async def login_start(self, update: Update, _):
         if not _admin(update.effective_user.id):
             await update.message.reply_text("⛔")
@@ -240,7 +381,8 @@ class SearchBot:
         await update.message.reply_text(f"✅ *{me.first_name}*", parse_mode="Markdown")
         return ConversationHandler.END
 
-    # ── /model ──
+    # ── /model ────────────────────────────────────────────────────────────────
+
     async def cmd_model(self, update: Update, _):
         if not _admin(update.effective_user.id):
             return await update.message.reply_text("⛔")
@@ -278,7 +420,8 @@ class SearchBot:
         except Exception as e:
             await q.edit_message_text(f"❌ `{e}`", parse_mode="Markdown")
 
-    # ── /export ──
+    # ── /export ───────────────────────────────────────────────────────────────
+
     async def cmd_export(self, update: Update, _):
         if not _admin(update.effective_user.id):
             return await update.message.reply_text("⛔")
@@ -290,7 +433,6 @@ class SearchBot:
             parts = await asyncio.to_thread(export_db, self.db)
             stats = parts[0][2]
             total_parts = len(parts)
-
             if total_parts == 1:
                 await _edit(msg, f"📦 Uploading ({stats['zip_mb']} MB) …", parse_mode="Markdown")
                 doc = io_module.BytesIO(parts[0][0])
@@ -323,7 +465,8 @@ class SearchBot:
             log.error("Export: %s", e, exc_info=True)
             await _edit(msg, f"❌ `{e}`", parse_mode="Markdown")
 
-    # ── /import ──
+    # ── /import ───────────────────────────────────────────────────────────────
+
     async def import_start(self, update: Update, _):
         if not _admin(update.effective_user.id):
             await update.message.reply_text("⛔")
@@ -341,8 +484,6 @@ class SearchBot:
 
     async def import_file(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id
-
-        # handle text message "done" for multi-part
         if update.message.text:
             text = update.message.text.strip().lower()
             if text == "done":
@@ -350,8 +491,7 @@ class SearchBot:
                 if not parts:
                     await update.message.reply_text("❌ No parts received\\.", parse_mode="Markdown")
                     return IMPORT_WAITING
-                msg = await update.message.reply_text(
-                    f"📥 Assembling {len(parts)} parts …")
+                msg = await update.message.reply_text(f"📥 Assembling {len(parts)} parts …")
                 try:
                     from db_manager import import_db_parts
                     r = await asyncio.to_thread(import_db_parts, parts)
@@ -376,16 +516,12 @@ class SearchBot:
         if not doc:
             await update.message.reply_text("📎 Send a file\\.", parse_mode="Markdown")
             return IMPORT_WAITING
-
         name = doc.file_name or ""
         sz = (doc.file_size or 0) / 1024 / 1024
-
         msg = await update.message.reply_text(f"📥 Downloading `{name}` ({sz:.1f} MB) …",
                                                parse_mode="Markdown")
         tf = await ctx.bot.get_file(doc.file_id)
         data = bytes(await tf.download_as_bytearray())
-
-        # single zip file
         if name.endswith(".zip"):
             await _edit(msg, "📥 Importing …", parse_mode="Markdown")
             try:
@@ -401,8 +537,6 @@ class SearchBot:
                 self.searcher = ImageSearcher(self.db, self.embedder)
                 await _edit(msg, f"❌ `{e}`", parse_mode="Markdown")
             return ConversationHandler.END
-
-        # multi-part file
         if "part" in name.lower():
             parts = self._import_parts.setdefault(uid, [])
             parts.append(data)
@@ -411,27 +545,26 @@ class SearchBot:
                 f"Send next part or type `done` to import\\.",
                 parse_mode="Markdown")
             return IMPORT_WAITING
-
         await _edit(msg, "❌ Send `.zip` or part files\\.", parse_mode="Markdown")
         return IMPORT_WAITING
 
-    # ── /monitor ──
+    # ── /monitor ──────────────────────────────────────────────────────────────
+
     async def cmd_monitor(self, update: Update, _):
         if not _admin(update.effective_user.id):
             return await update.message.reply_text("⛔")
-
         running = self._monitor and self._monitor.running
-
         buttons = []
         if running:
             st = self._monitor.stats
             buttons.append([InlineKeyboardButton("⏹ Stop", callback_data="mon_stop")])
             buttons.append([InlineKeyboardButton("📊 Status", callback_data="mon_status")])
             await update.message.reply_text(
-                f"📡 *Monitor Running*\n\n"
+                f"📡 *Monitor Running* \\(auto\\-on by default\\)\n\n"
                 f"📸 New indexed: *{st['new_images']}*\n"
                 f"🗑 Deleted removed: *{st['deleted_images']}*\n"
-                f"❌ Errors: *{st['errors']}*",
+                f"❌ Errors: *{st['errors']}*\n\n"
+                f"_Restarts automatically on bot reboot\\._",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(buttons))
         else:
@@ -443,9 +576,10 @@ class SearchBot:
             ch = self.db.list_channels()
             await update.message.reply_text(
                 f"📡 *Channel Monitor*\n\n"
-                f"Watches *{len(ch)}* indexed channels for:\n"
+                f"Watches *{len(ch)}* indexed channel(s) for:\n"
                 f"  📸 New images → auto\\-embed\n"
-                f"  🗑 Deleted images → remove vectors\n",
+                f"  🗑 Deleted images → remove vectors\n\n"
+                f"_Normally starts automatically on bot boot\\._",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -454,12 +588,10 @@ class SearchBot:
         await q.answer()
         if not _admin(q.from_user.id):
             return
-
         if q.data == "mon_start":
             await q.edit_message_text("📡 Starting monitor …", parse_mode="Markdown")
             from monitor import ChannelMonitor
-            self._monitor = ChannelMonitor(self.db, self.embedder)
-
+            self._monitor = ChannelMonitor(self.db, self.embedder, db_lock=self._db_lock)
             chat_id = q.message.chat_id
             bot = q.get_bot()
 
@@ -468,6 +600,7 @@ class SearchBot:
                     await bot.send_message(chat_id, text, parse_mode="Markdown")
                 except Exception:
                     pass
+                await self._update_pinned_message(bot)
 
             result = await self._monitor.start(notify_callback=notify)
             await q.edit_message_text(f"📡 {result}", parse_mode="Markdown")
@@ -489,20 +622,98 @@ class SearchBot:
                     f"📊 DB: *{self.db.count():,}*",
                     parse_mode="Markdown")
 
-    # ── /cleanup ──
+    # ── /setpinned ────────────────────────────────────────────────────────────
+
+    async def cmd_setpinned(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """
+        Create and pin a live status message in this chat.
+        The bot auto-edits it whenever images are indexed or removed.
+        """
+        if not _admin(update.effective_user.id):
+            return await update.message.reply_text("⛔")
+        text = _status_text(self.db, self._monitor, new_images=0, removed_images=0, errors=0)
+        msg = await update.message.reply_text(text, parse_mode="Markdown")
+        try:
+            await ctx.bot.pin_chat_message(
+                chat_id=update.effective_chat.id,
+                message_id=msg.message_id,
+                disable_notification=True,
+            )
+        except Exception as e:
+            log.debug("Pin error: %s", e)
+        chat_id_str = str(update.effective_chat.id)
+        self._pinned[chat_id_str] = msg.message_id
+        _state.put("pinned", self._pinned)
+        await update.message.reply_text(
+            "✅ *Live status pinned\\!*\n"
+            "Updates automatically whenever images are indexed or removed\\.",
+            parse_mode="Markdown",
+        )
+
+    # ── /checkupdates ─────────────────────────────────────────────────────────
+
+    async def cmd_checkupdates(self, update: Update, _):
+        """
+        Manually scan all indexed channels for images added since last run.
+        Same logic as the automatic startup sync.
+        """
+        if not _admin(update.effective_user.id):
+            return await update.message.reply_text("⛔")
+        from indexer import session_exists
+        if not session_exists():
+            return await update.message.reply_text("❌ /login first\\.", parse_mode="Markdown")
+        if not self.embedder.is_ready():
+            return await update.message.reply_text("❌ /model first\\.", parse_mode="Markdown")
+        ch = self.db.list_channels()
+        if not ch:
+            return await update.message.reply_text("❌ No indexed channels\\.", parse_mode="Markdown")
+        msg = await update.message.reply_text(
+            f"🔄 Checking *{len(ch)}* channel(s) for new images …",
+            parse_mode="Markdown",
+        )
+        self._track(self._do_checkupdates(msg, list(ch.keys())))
+
+    async def _do_checkupdates(self, msg, channel_ids: list):
+        total_new = 0
+        lines = []
+        for ch_id_str in channel_ids:
+            try:
+                from indexer import ChannelIndexer
+                async with self._db_lock:
+                    count = await ChannelIndexer(self.db, self.embedder).index_channel(
+                        int(ch_id_str), limit=None, progress_callback=None,
+                    )
+                if count > 0:
+                    lines.append(f"  ✅ `{ch_id_str}` → \\+{count} new")
+                    total_new += count
+            except Exception as e:
+                lines.append(f"  ❌ `{ch_id_str}`: {e}")
+
+        detail = "\n".join(lines) if lines else "  _No new images found\\._"
+        icon = "✅" if total_new > 0 else "💤"
+        await _edit(
+            msg,
+            f"{icon} *Check complete*\n\n"
+            f"📸 New images: *{total_new}*\n\n"
+            f"{detail}\n\n"
+            f"📊 Total DB: *{self.db.count():,}*",
+            parse_mode="Markdown",
+        )
+        if total_new > 0 and self._app:
+            await self._update_pinned_message(self._app.bot)
+
+    # ── /cleanup ──────────────────────────────────────────────────────────────
+
     async def cmd_cleanup(self, update: Update, _):
         if not _admin(update.effective_user.id):
             return await update.message.reply_text("⛔")
         ch = self.db.list_channels()
         if not ch:
             return await update.message.reply_text("❌ No channels\\.", parse_mode="Markdown")
-
         buttons = []
         for cid in ch:
-            buttons.append([InlineKeyboardButton(
-                f"🧹 Channel {cid}", callback_data=f"clean_{cid}")])
+            buttons.append([InlineKeyboardButton(f"🧹 Channel {cid}", callback_data=f"clean_{cid}")])
         buttons.append([InlineKeyboardButton("🧹 All Channels", callback_data="clean_all")])
-
         await update.message.reply_text(
             "🧹 *Cleanup Deleted Images*\n\n"
             "Checks if indexed messages still exist\\.\n"
@@ -515,12 +726,9 @@ class SearchBot:
         await q.answer()
         if not _admin(q.from_user.id):
             return
-
         if q.data == "clean_all":
             channels = list(self.db.list_channels().keys())
-            await q.edit_message_text(
-                f"🧹 Cleaning *{len(channels)}* channels …",
-                parse_mode="Markdown")
+            await q.edit_message_text(f"🧹 Cleaning *{len(channels)}* channels …", parse_mode="Markdown")
             self._track(self._do_cleanup_all(q, channels))
         elif q.data.startswith("clean_"):
             cid = q.data.replace("clean_", "")
@@ -530,14 +738,11 @@ class SearchBot:
     async def _do_cleanup(self, q, channel_id):
         try:
             from monitor import ChannelMonitor
-            cm = ChannelMonitor(self.db, self.embedder)
-
+            cm = ChannelMonitor(self.db, self.embedder, db_lock=self._db_lock)
             async def prog(checked, total, removed):
                 if checked % 200 == 0:
-                    await _edit(q.message,
-                        f"🧹 Checking {checked}/{total} … removed {removed}",
-                        parse_mode="Markdown")
-
+                    await _edit(q.message, f"🧹 Checking {checked}/{total} … removed {removed}",
+                                parse_mode="Markdown")
             r = await cm.cleanup_channel(channel_id, progress_callback=prog)
             await _edit(q.message,
                 f"✅ *Cleanup done*\n\n"
@@ -546,6 +751,8 @@ class SearchBot:
                 f"🗑 Removed: *{r['removed']}*\n"
                 f"📊 Remaining: *{r['remaining']:,}*",
                 parse_mode="Markdown")
+            if r["removed"] > 0 and self._app:
+                await self._update_pinned_message(self._app.bot)
         except Exception as e:
             await _edit(q.message, f"❌ `{e}`", parse_mode="Markdown")
 
@@ -555,10 +762,9 @@ class SearchBot:
         for i, cid in enumerate(channel_ids, 1):
             try:
                 from monitor import ChannelMonitor
-                cm = ChannelMonitor(self.db, self.embedder)
-                await _edit(q.message,
-                    f"🧹 Channel {i}/{len(channel_ids)} (`{cid}`) …",
-                    parse_mode="Markdown")
+                cm = ChannelMonitor(self.db, self.embedder, db_lock=self._db_lock)
+                await _edit(q.message, f"🧹 Channel {i}/{len(channel_ids)} (`{cid}`) …",
+                            parse_mode="Markdown")
                 r = await cm.cleanup_channel(int(cid))
                 total_removed += r["removed"]
                 total_checked += r["checked"]
@@ -570,8 +776,11 @@ class SearchBot:
             f"🗑 Removed: *{total_removed}*\n"
             f"📊 DB: *{self.db.count():,}*",
             parse_mode="Markdown")
+        if total_removed > 0 and self._app:
+            await self._update_pinned_message(self._app.bot)
 
-    # ── /duplicates ──
+    # ── /duplicates ───────────────────────────────────────────────────────────
+
     async def cmd_duplicates(self, update: Update, _):
         if not _admin(update.effective_user.id):
             return await update.message.reply_text("⛔")
@@ -670,7 +879,8 @@ class SearchBot:
                                     reply_markup=InlineKeyboardMarkup([nav]))
         except Exception: pass
 
-    # ── /index ──
+    # ── /index ────────────────────────────────────────────────────────────────
+
     async def index_start(self, update: Update, _):
         if not _admin(update.effective_user.id):
             await update.message.reply_text("⛔")
@@ -746,17 +956,21 @@ class SearchBot:
                     f"⏳ ✅*{s.embedded}* ⬇️*{s.downloaded}* ({s.mb_downloaded:.1f}MB)\n"
                     f"⏭{s.skipped} ❌{s.errors} 🚀*{s.speed:.1f}/s* ⏱*{m}m{sec}s*{fl}",
                     parse_mode="Markdown")
-            count = await ChannelIndexer(self.db, self.embedder).index_channel(
-                ch, limit=limit, progress_callback=prog)
+            async with self._db_lock:
+                count = await ChannelIndexer(self.db, self.embedder).index_channel(
+                    ch, limit=limit, progress_callback=prog)
             ss = await asyncio.to_thread(system_info.get_system_stats)
             await _edit(msg,
                 f"✅ *Done\\!* 📸*{count}* 📊*{self.db.count():,}* "
                 f"💾*{ss['chroma_mb']:.1f}MB* 🧠*{ss['ram_used_mb']:.0f}MB*",
                 parse_mode="Markdown")
+            if count > 0 and self._app:
+                await self._update_pinned_message(self._app.bot)
         except Exception as e:
             await _edit(msg, f"❌ `{e}`", parse_mode="Markdown")
 
-    # ── photo ──
+    # ── photo / doc ───────────────────────────────────────────────────────────
+
     async def on_photo(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self.embedder.is_ready():
             return await update.message.reply_text("❌ /model first")
@@ -784,25 +998,35 @@ class SearchBot:
         except Exception as e:
             await _edit(msg, f"⚠️ `{e}`", parse_mode="Markdown")
 
-    # ── run ──
+    # ── run ───────────────────────────────────────────────────────────────────
+
     def run(self):
-        app = Application.builder().token(config.BOT_TOKEN).build()
-        app.add_handler(CommandHandler("start", self.cmd_start))
-        app.add_handler(CommandHandler("stats", self.cmd_stats))
-        app.add_handler(CommandHandler("system", self.cmd_system))
-        app.add_handler(CommandHandler("session", self.cmd_session))
-        app.add_handler(CommandHandler("autotune", self.cmd_autotune))
-        app.add_handler(CommandHandler("export", self.cmd_export))
-        app.add_handler(CommandHandler("duplicates", self.cmd_duplicates))
-        app.add_handler(CommandHandler("monitor", self.cmd_monitor))
-        app.add_handler(CommandHandler("cleanup", self.cmd_cleanup))
+        app = (
+            Application.builder()
+            .token(config.BOT_TOKEN)
+            .post_init(self._on_startup)   # auto-start monitor + sync on every boot
+            .build()
+        )
+        self._app = app
+
+        app.add_handler(CommandHandler("start",         self.cmd_start))
+        app.add_handler(CommandHandler("stats",         self.cmd_stats))
+        app.add_handler(CommandHandler("system",        self.cmd_system))
+        app.add_handler(CommandHandler("session",       self.cmd_session))
+        app.add_handler(CommandHandler("autotune",      self.cmd_autotune))
+        app.add_handler(CommandHandler("export",        self.cmd_export))
+        app.add_handler(CommandHandler("duplicates",    self.cmd_duplicates))
+        app.add_handler(CommandHandler("monitor",       self.cmd_monitor))
+        app.add_handler(CommandHandler("cleanup",       self.cmd_cleanup))
+        app.add_handler(CommandHandler("checkupdates",  self.cmd_checkupdates))  # NEW
+        app.add_handler(CommandHandler("setpinned",     self.cmd_setpinned))     # NEW
 
         app.add_handler(ConversationHandler(
             entry_points=[CommandHandler("login", self.login_start)],
             states={
                 LOGIN_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.login_phone)],
-                LOGIN_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.login_code)],
-                LOGIN_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.login_2fa)],
+                LOGIN_CODE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, self.login_code)],
+                LOGIN_2FA:   [MessageHandler(filters.TEXT & ~filters.COMMAND, self.login_2fa)],
             },
             fallbacks=[CommandHandler("cancel", self.cmd_cancel)],
             conversation_timeout=300))
@@ -820,17 +1044,17 @@ class SearchBot:
             entry_points=[CommandHandler("index", self.index_start)],
             states={
                 INDEX_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.index_channel)],
-                INDEX_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.index_limit)],
+                INDEX_LIMIT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, self.index_limit)],
             },
             fallbacks=[CommandHandler("cancel", self.cmd_cancel)],
             conversation_timeout=300))
 
         app.add_handler(CommandHandler("model", self.cmd_model))
-        app.add_handler(CallbackQueryHandler(self.model_cb, pattern=r"^dl_"))
-        app.add_handler(CallbackQueryHandler(self.dup_cb, pattern=r"^dup_"))
+        app.add_handler(CallbackQueryHandler(self.model_cb,   pattern=r"^dl_"))
+        app.add_handler(CallbackQueryHandler(self.dup_cb,     pattern=r"^dup_"))
         app.add_handler(CallbackQueryHandler(self.monitor_cb, pattern=r"^mon_"))
         app.add_handler(CallbackQueryHandler(self.cleanup_cb, pattern=r"^clean_"))
-        app.add_handler(MessageHandler(filters.PHOTO, self.on_photo))
+        app.add_handler(MessageHandler(filters.PHOTO,        self.on_photo))
         app.add_handler(MessageHandler(filters.Document.ALL, self.on_doc))
         app.add_handler(CommandHandler("cancel", self.cmd_cancel))
 
