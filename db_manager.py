@@ -153,7 +153,7 @@ class DuplicateFinder:
         ids = all_data["ids"]
         embeddings = all_data["embeddings"]
         metadatas = all_data["metadatas"]
-        if not ids or not embeddings:
+        if not ids or embeddings is None or len(embeddings) == 0:
             return []
         seen = set()
         groups = []
@@ -170,7 +170,7 @@ class DuplicateFinder:
                 mid = results["ids"][0][j]
                 if mid == ids[i] or mid in seen:
                     continue
-                sim = 1.0 - results["distances"][0][j]
+                sim = float(1.0 - results["distances"][0][j])
                 if sim >= threshold:
                     meta = results["metadatas"][0][j]
                     matches.append({
