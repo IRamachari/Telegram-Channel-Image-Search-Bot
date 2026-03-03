@@ -854,18 +854,25 @@ class SearchBot:
         tp = (len(groups) + pp - 1) // pp
         pg = groups[page * pp:(page + 1) * pp]
         td = sum(g["count"] for g in groups)
-        lines = [f"🔍 *Duplicates* {page + 1}/{tp}\n_{len(groups)} groups, {td} total_\n"]
+        lines = [f"🔍 *Duplicates* {page + 1}/{tp}\n_{len(groups)} groups, {td} reposts total_\n"]
         for gi, g in enumerate(pg, start=page * pp + 1):
             src = g["source"]
-            lines.append(f"▸ *Group {gi}* ({g['count']})")
-            lines.append(f"  📌 [{src['channel_name']}]({src['link']})"
-                         f"{' 🔒' if src.get('private') else ''}")
+            src_date = (src.get('date') or '')[:10] or 'unknown'
+            lock = ' 🔒' if src.get('private') else ''
+            lines.append(f"▸ *Group {gi}* — {g['count']} repost(s)")
+            lines.append(
+                f"  📌 [original]({src['link']}) `{src_date}`"
+                f" — {src['channel_name']}{lock}"
+            )
             for m in g["matches"][:3]:
-                lines.append(f"  🟢 {m['similarity']*100:.1f}% "
-                             f"[{m['channel_name']}]({m['link']})"
-                             f"{' 🔒' if m.get('private') else ''}")
+                m_date = (m.get('date') or '')[:10] or 'unknown'
+                m_lock = ' 🔒' if m.get('private') else ''
+                lines.append(
+                    f"  🔁 {m['similarity']*100:.1f}% [repost]({m['link']}) `{m_date}`"
+                    f" — {m['channel_name']}{m_lock}"
+                )
             if g["count"] > 3:
-                lines.append(f"  _\\+{g['count'] - 3} more_")
+                lines.append(f"  _\\+{g['count'] - 3} more reposts_")
             lines.append("")
         nav = []
         if page > 0:

@@ -141,67 +141,97 @@ def import_db_parts(parts: list[bytes]) -> dict:
 
 
 class DuplicateFinder:
-    def __init__(self, db: VectorDB):
+    def __init__(self, db):
         self.db = db
 
+    @staticmethod
+    def _day(date_str):
+        return (date_str or '')[:10]
+
     def find_all(self, threshold=0.95, page_size=100, progress_callback=None):
-        col = self.db.col
+        """
+        Find images that were posted on more than one distinct date.
+        No fixed neighbour cap — ALL images above threshold are checked.
+        Same-day matches are skipped entirely.
+        """
+        col   = self.db.col
         total = col.count()
         if total < 2:
             return []
-        all_data = col.get(include=["embeddings", "metadatas"], limit=total)
-        ids = all_data["ids"]
-        embeddings = all_data["embeddings"]
-        metadatas = all_data["metadatas"]
+
+        all_data   = col.get(include=['embeddings', 'metadatas'], limit=total)
+        ids        = all_data['ids']
+        embeddings = all_data['embeddings']
+        metadatas  = all_data['metadatas']
         if not ids or embeddings is None or len(embeddings) == 0:
             return []
-        seen = set()
-        groups = []
+
+        group_seen = set()
+        match_seen = set()
+        groups     = []
+
         for i in range(len(ids)):
-            if ids[i] in seen:
+            src_id = ids[i]
+            if src_id in group_seen or src_id in match_seen:
                 continue
+
+            src_meta = metadatas[i]
+            src_day  = self._day(src_meta.get('date', ''))
+
+            # Query ALL vectors — no fixed cap so nothing is missed
             results = col.query(
                 query_embeddings=[embeddings[i]],
-                n_results=min(20, total),
-                include=["metadatas", "distances"],
+                n_results=total,
+                include=['metadatas', 'distances'],
             )
+
             matches = []
-            for j in range(len(results["ids"][0])):
-                mid = results["ids"][0][j]
-                if mid == ids[i] or mid in seen:
+            for j in range(len(results['ids'][0])):
+                mid = results['ids'][0][j]
+                if mid == src_id or mid in group_seen or mid in match_seen:
                     continue
-                sim = float(1.0 - results["distances"][0][j])
-                if sim >= threshold:
-                    meta = results["metadatas"][0][j]
-                    matches.append({
-                        "id": mid,
-                        "similarity": round(sim, 4),
-                        "channel_name": meta.get("channel_name", ""),
-                        "message_id": meta.get("message_id", 0),
-                        "link": meta.get("link", ""),
-                        "date": meta.get("date", ""),
-                        "private": meta.get("private", False),
-                    })
-            if matches:
-                seen.add(ids[i])
-                for m in matches:
-                    seen.add(m["id"])
-                src = metadatas[i]
-                groups.append({
-                    "source": {
-                        "id": ids[i],
-                        "channel_name": src.get("channel_name", ""),
-                        "message_id": src.get("message_id", 0),
-                        "link": src.get("link", ""),
-                        "date": src.get("date", ""),
-                        "private": src.get("private", False),
-                    },
-                    "matches": sorted(matches, key=lambda x: x["similarity"], reverse=True),
-                    "count": len(matches),
+                sim = float(1.0 - results['distances'][0][j])
+                if sim < threshold:
+                    break  # results are sorted by distance, safe to stop early
+                meta      = results['metadatas'][0][j]
+                match_day = self._day(meta.get('date', ''))
+                # Only flag if on a DIFFERENT date
+                if match_day == src_day:
+                    continue
+                matches.append({
+                    'id':           mid,
+                    'similarity':   round(sim, 4),
+                    'channel_name': meta.get('channel_name', ''),
+                    'message_id':   meta.get('message_id', 0),
+                    'link':         meta.get('link', ''),
+                    'date':         meta.get('date', ''),
+                    'private':      meta.get('private', False),
                 })
+
+            if matches:
+                group_seen.add(src_id)
+                for m in matches:
+                    match_seen.add(m['id'])
+                # chronological order: original first, newest repost last
+                matches.sort(key=lambda x: x['date'])
+                groups.append({
+                    'source': {
+                        'id':           src_id,
+                        'channel_name': src_meta.get('channel_name', ''),
+                        'message_id':   src_meta.get('message_id', 0),
+                        'link':         src_meta.get('link', ''),
+                        'date':         src_meta.get('date', ''),
+                        'private':      src_meta.get('private', False),
+                    },
+                    'matches': matches,
+                    'count':   len(matches),
+                })
+
             if progress_callback and (i + 1) % page_size == 0:
                 progress_callback(i + 1, total, len(groups))
+
         if progress_callback:
             progress_callback(len(ids), total, len(groups))
-        groups.sort(key=lambda g: g["count"], reverse=True)
+
+        groups.sort(key=lambda g: g['count'], reverse=True)
         return groups
