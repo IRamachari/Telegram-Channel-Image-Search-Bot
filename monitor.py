@@ -77,13 +77,12 @@ class ChannelMonitor:
         if not channels:
             return "No channels indexed. /index first."
 
-        if not os.path.exists(config.SESSION_FILE):
+        from tg_client import user_session_available, make_user_client
+        if not user_session_available():
             return "No session. /login first."
 
         self._notify_callback = notify_callback
-        self.client = TelegramClient(
-            config.SESSION_PATH, config.API_ID, config.API_HASH,
-        )
+        self.client = make_user_client()
         await self.client.connect()
 
         if not await self.client.is_user_authorized():
@@ -252,9 +251,8 @@ class ChannelMonitor:
         """
         Check all indexed messages — remove vectors for deleted ones.
         """
-        client = TelegramClient(
-            config.SESSION_PATH, config.API_ID, config.API_HASH,
-        )
+        from tg_client import make_user_client
+        client = make_user_client()
         await client.connect()
         if not await client.is_user_authorized():
             await client.disconnect()

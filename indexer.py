@@ -59,23 +59,31 @@ def get_speed_info():
 
 
 def session_exists():
-    return os.path.exists(config.SESSION_FILE)
+    # A usable session is EITHER an env StringSession OR an on-disk .session file.
+    from tg_client import user_session_available
+    return user_session_available()
 
 
 def session_info():
+    from tg_client import has_string_session, session_location
     p = config.SESSION_FILE
-    return {"path": p, "exists": os.path.exists(p),
-            "size": os.path.getsize(p) if os.path.exists(p) else 0,
+    file_exists = os.path.exists(p)
+    return {"path": session_location(),
+            "exists": has_string_session() or file_exists,
+            "string_session": has_string_session(),
+            "size": os.path.getsize(p) if file_exists else 0,
             "cwd": os.getcwd()}
 
 
 def _make_client():
-    return TelegramClient(config.SESSION_PATH, config.API_ID, config.API_HASH)
+    from tg_client import make_user_client
+    return make_user_client()
 
 
 async def check_session():
     if not session_exists():
-        return False, f"Not found: {config.SESSION_FILE}"
+        from tg_client import session_location
+        return False, f"No session at {session_location()}"
     c = _make_client()
     try:
         await c.connect()

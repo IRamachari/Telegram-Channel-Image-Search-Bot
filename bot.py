@@ -101,11 +101,80 @@ class SearchBot:
         self._pinned: dict[str, int] = _state.get("pinned", {})
         # Serialise ALL ChromaDB writes — prevents "database is locked" errors
         self._db_lock: asyncio.Lock = asyncio.Lock()
+        # Telethon bot client (MTProto) used to download user-sent files with
+        # NO 20 MB limit. Started lazily on first use.
+        self._mtproto = None
+        self._mtproto_lock: asyncio.Lock = asyncio.Lock()
 
     def _track(self, coro):
         t = asyncio.create_task(coro)
         self._tasks.add(t)
         t.add_done_callback(self._tasks.discard)
+
+    # ── MTProto downloads (no 20 MB Bot-API limit) ──────────────────────────────
+
+    async def _get_mtproto(self):
+        """
+        Lazily start a Telethon client logged in as the bot (over MTProto).
+        Reused for the lifetime of the process. Returns None if it can't start
+        (e.g. missing API credentials), so callers can fall back to the Bot API.
+        """
+        if self._mtproto is not None:
+            return self._mtproto
+        async with self._mtproto_lock:
+            if self._mtproto is not None:
+                return self._mtproto
+            if config.API_ID == 0 or not config.API_HASH or not config.BOT_TOKEN:
+                log.warning("MTProto downloader unavailable: set TELEGRAM_API_ID, "
+                            "TELEGRAM_API_HASH and BOT_TOKEN to download files >20 MB.")
+                return None
+            try:
+                from tg_client import make_bot_client
+                client = make_bot_client()
+                await client.start(bot_token=config.BOT_TOKEN)
+                self._mtproto = client
+                log.info("MTProto download client started (bot session).")
+            except Exception as e:
+                log.error("Could not start MTProto download client: %s", e)
+                self._mtproto = None
+            return self._mtproto
+
+    async def _download_via_mtproto(self, chat_id: int, message_id: int) -> bytes:
+        """Download a user-sent message's media as raw bytes over MTProto."""
+        client = await self._get_mtproto()
+        if client is None:
+            raise RuntimeError("MTProto client unavailable")
+        msgs = await client.get_messages(chat_id, ids=message_id)
+        msg = msgs[0] if isinstance(msgs, list) else msgs
+        if msg is None or not getattr(msg, "media", None):
+            raise RuntimeError("media not found for message")
+        data = await client.download_media(msg, file=bytes)
+        if not data:
+            raise RuntimeError("empty download")
+        return data
+
+    async def _fetch_media_bytes(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                                 file_id: str, size_bytes: int = 0) -> bytes:
+        """
+        Get the bytes of a file the user just sent. Prefers MTProto (no size
+        cap); falls back to the Bot API for small files when MTProto is
+        unavailable. Raises a clear error if a large file can't be fetched.
+        """
+        chat_id = update.effective_chat.id
+        message_id = update.effective_message.message_id
+        try:
+            return await self._download_via_mtproto(chat_id, message_id)
+        except Exception as e:
+            big = size_bytes and size_bytes > 19 * 1024 * 1024
+            if big:
+                raise RuntimeError(
+                    "file is larger than 20 MB and the MTProto downloader is "
+                    "unavailable — check TELEGRAM_API_ID / TELEGRAM_API_HASH / "
+                    f"BOT_TOKEN. ({e})"
+                )
+            log.warning("MTProto download failed (%s); falling back to Bot API.", e)
+            tf = await ctx.bot.get_file(file_id)
+            return bytes(await tf.download_as_bytearray())
 
     # ── Startup hook ──────────────────────────────────────────────────────────
 
@@ -175,6 +244,15 @@ class SearchBot:
                 log.debug("Startup notify error: %s", e)
 
         await self._update_pinned_message(app.bot)
+
+    async def _on_shutdown(self, app: Application) -> None:
+        """Cleanly disconnect the MTProto download client on shutdown."""
+        if self._mtproto is not None:
+            try:
+                await self._mtproto.disconnect()
+            except Exception:
+                pass
+            self._mtproto = None
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -247,8 +325,9 @@ class SearchBot:
         from indexer import session_info, check_session
         si = session_info()
         v, d = await check_session()
+        mode = "String session (env)" if si.get("string_session") else "Session file"
         await update.message.reply_text(
-            f"🔐 *Session*\n`{si['path']}`\n"
+            f"🔐 *Session*\nMode: {mode}\n`{si['path']}`\n"
             f"{'✅' if si['exists'] else '❌'} | Auth: {'✅' if v else '❌'}\n{d}",
             parse_mode="Markdown",
         )
@@ -310,6 +389,13 @@ class SearchBot:
             return ConversationHandler.END
         if config.API_ID == 0:
             await update.message.reply_text("❌ Set API\\_ID\\.", parse_mode="Markdown")
+            return ConversationHandler.END
+        from tg_client import has_string_session
+        if has_string_session():
+            await update.message.reply_text(
+                "ℹ️ A `TELETHON_STRING_SESSION` is already configured, so login "
+                "isn't needed\\.\nUse /session to verify it\\.",
+                parse_mode="Markdown")
             return ConversationHandler.END
         await update.message.reply_text(
             "🔐 Phone with country code\\.\n`+1234567890`\n/cancel",
@@ -520,8 +606,12 @@ class SearchBot:
         sz = (doc.file_size or 0) / 1024 / 1024
         msg = await update.message.reply_text(f"📥 Downloading `{name}` ({sz:.1f} MB) …",
                                                parse_mode="Markdown")
-        tf = await ctx.bot.get_file(doc.file_id)
-        data = bytes(await tf.download_as_bytearray())
+        try:
+            data = await self._fetch_media_bytes(
+                update, ctx, doc.file_id, size_bytes=doc.file_size or 0)
+        except Exception as e:
+            await _edit(msg, f"❌ Download failed: `{e}`", parse_mode="Markdown")
+            return IMPORT_WAITING
         if name.endswith(".zip"):
             await _edit(msg, "📥 Importing …", parse_mode="Markdown")
             try:
@@ -982,8 +1072,12 @@ class SearchBot:
         if not self.embedder.is_ready():
             return await update.message.reply_text("❌ /model first")
         msg = await update.message.reply_text("🔍 …")
-        tf = await ctx.bot.get_file(update.message.photo[-1].file_id)
-        data = bytes(await tf.download_as_bytearray())
+        photo = update.message.photo[-1]
+        try:
+            data = await self._fetch_media_bytes(
+                update, ctx, photo.file_id, size_bytes=getattr(photo, "file_size", 0) or 0)
+        except Exception as e:
+            return await _edit(msg, f"⚠️ Download failed: `{e}`", parse_mode="Markdown")
         try:
             hits = await asyncio.to_thread(self.searcher.duplicates, data=data)
             await _edit(msg, _fmt(hits), parse_mode="Markdown", disable_web_page_preview=True)
@@ -997,8 +1091,11 @@ class SearchBot:
         if not self.embedder.is_ready():
             return await update.message.reply_text("❌ /model first")
         msg = await update.message.reply_text("🔍 …")
-        tf = await ctx.bot.get_file(doc.file_id)
-        data = bytes(await tf.download_as_bytearray())
+        try:
+            data = await self._fetch_media_bytes(
+                update, ctx, doc.file_id, size_bytes=doc.file_size or 0)
+        except Exception as e:
+            return await _edit(msg, f"⚠️ Download failed: `{e}`", parse_mode="Markdown")
         try:
             hits = await asyncio.to_thread(self.searcher.duplicates, data=data)
             await _edit(msg, _fmt(hits), parse_mode="Markdown", disable_web_page_preview=True)
@@ -1012,6 +1109,7 @@ class SearchBot:
             Application.builder()
             .token(config.BOT_TOKEN)
             .post_init(self._on_startup)   # auto-start monitor + sync on every boot
+            .post_shutdown(self._on_shutdown)
             .build()
         )
         self._app = app
