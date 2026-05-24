@@ -254,6 +254,27 @@ class SearchBot:
                 pass
             self._mtproto = None
 
+    async def _on_error(self, update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        Global error handler. Without this, any exception in a handler — most
+        commonly a Telegram 'Can't parse entities' Markdown error from dynamic
+        text — is logged as 'No error handlers are registered' and the user
+        sees nothing. Here we log it and try to reply once in PLAIN text so the
+        reply itself can't fail to parse.
+        """
+        log.error("Handler error: %s", ctx.error, exc_info=ctx.error)
+        msg = getattr(update, "effective_message", None)
+        if msg is None:
+            return
+        try:
+            from telegram.error import BadRequest
+            if isinstance(ctx.error, BadRequest) and "parse entities" in str(ctx.error):
+                # The original reply failed Markdown parsing; nothing to resend.
+                return
+            await msg.reply_text("⚠️ Something went wrong handling that. Please try again.")
+        except Exception:
+            pass
+
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     async def _sync_channels(self, channel_ids: list) -> int:
@@ -326,10 +347,14 @@ class SearchBot:
         si = session_info()
         v, d = await check_session()
         mode = "String session (env)" if si.get("string_session") else "Session file"
+        # Plain text (no Markdown): si['path'], the account name, and any error
+        # string in `d` are arbitrary and must not be parsed as Markdown.
         await update.message.reply_text(
-            f"🔐 *Session*\nMode: {mode}\n`{si['path']}`\n"
-            f"{'✅' if si['exists'] else '❌'} | Auth: {'✅' if v else '❌'}\n{d}",
-            parse_mode="Markdown",
+            f"🔐 Session\n"
+            f"Mode: {mode}\n"
+            f"{si['path']}\n"
+            f"{'✅' if si['exists'] else '❌'} | Auth: {'✅' if v else '❌'}\n"
+            f"{d}"
         )
 
     # ── /stats ────────────────────────────────────────────────────────────────
@@ -1113,6 +1138,8 @@ class SearchBot:
             .build()
         )
         self._app = app
+
+        app.add_error_handler(self._on_error)
 
         app.add_handler(CommandHandler("start",         self.cmd_start))
         app.add_handler(CommandHandler("stats",         self.cmd_stats))
