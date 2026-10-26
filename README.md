@@ -1,6 +1,6 @@
 # Telegram Channel Image Search Bot
 
-A self-hosted Telegram bot that indexes images from your Telegram channels and lets you find visually similar images by simply sending a photo. Powered by OpenAI CLIP for image embeddings and ChromaDB as the vector database.
+A self-hosted Telegram bot that indexes images from your Telegram channels and lets you find visually similar images by simply sending a photo. Powered by OpenAI CLIP for image embeddings and a compact built-in vector store (HNSW + SQLite) instead of heavyweight vector-database packages.
 
 ---
 
@@ -8,7 +8,7 @@ A self-hosted Telegram bot that indexes images from your Telegram channels and l
 
 1. The bot connects to your Telegram account via **Telethon (MTProto)**.
 2. It downloads images from your specified channels and converts them into vector embeddings using CLIP.
-3. Embeddings are stored in a local ChromaDB vector database.
+3. Embeddings are stored in a local vector store — an SQLite database with a usearch HNSW graph on top (~25 packages instead of ChromaDB's ~120).
 4. When you send a photo to the bot, it embeds your image and searches the database for the closest visual matches.
 5. A real-time monitor watches your channels for new images and indexes them automatically as they are posted.
 
@@ -28,6 +28,33 @@ A self-hosted Telegram bot that indexes images from your Telegram channels and l
 - **DB backup & restore** — export the full database as a zip and reimport it later (auto-split for large databases).
 - **Multiple CLIP models** — choose between faster smaller models or slower higher-accuracy ones.
 - **Auto-tune** — automatically adjusts batch size and parallelism based on available RAM.
+- **Up to 336px input** — the high-accuracy models embed at 336×336 instead of 224×224; the resolution is read from the model file itself, so no config change is needed. Chinese-CLIP is included for multilingual / CJK channel content.
+
+---
+
+## Choosing a CLIP model
+
+| Key | Model | Size | RAM | Input | Notes |
+|-----|-------|------|-----|-------|-------|
+| `vit-b-32` | CLIP ViT-B/32 | 85 MB | 350 MB | 224 px | Fastest, general use |
+| `vit-b-16` | CLIP ViT-B/16 | 110 MB | 500 MB | 224 px | Better detail, handles edits |
+| `vit-l-14` | CLIP ViT-L/14 | 350 MB | 1.2 GB | 224 px | High accuracy |
+| `vit-l-14-336` | CLIP ViT-L/14 @336 | 307 MB | 1.8 GB | 336 px | **Best general accuracy** |
+| `chinese-clip-l-336` | Chinese-CLIP ViT-L/14 | 307 MB | 1.8 GB | 336 px | Best for CJK / multilingual channels |
+
+Use `/model` to download and switch. The input resolution and crop mode are read
+from the model file (and the recorded model settings), so 224 px and 336 px models
+both work without any configuration.
+
+**Changing the model invalidates the existing vectors.** A different embedding
+dimension makes the store reject the next insert outright; a same-dimension model
+produces a different (incomparable) feature space with no error at all. The bot
+stores a model fingerprint inside the database directory and warns on startup, on
+`/import`, and on `/model` whenever the recorded model no longer matches what is
+on disk — **run `/index` again after any model change.**
+
+`auto-tune` recommends the 336 px model whenever RAM permits; you can always
+override with `/model`.
 
 ---
 
@@ -57,7 +84,7 @@ A self-hosted Telegram bot that indexes images from your Telegram channels and l
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.11+
 - Telegram API credentials from [my.telegram.org](https://my.telegram.org)
 - A bot token from [@BotFather](https://t.me/BotFather)
 - ~500 MB RAM minimum (depends on the model chosen)
@@ -96,8 +123,7 @@ Every variable, what it's for, and whether you need it.
 | `MAX_RESULTS` | `10` | Maximum number of matches returned per search. |
 | `BATCH_SIZE` | `32` | How many images are embedded by CLIP per batch during indexing. Larger = faster but more RAM. (Auto-tune may override this.) |
 | `PARALLEL_DOWNLOADS` | `10` | How many images are downloaded concurrently while indexing. Higher = faster but more likely to hit Telegram flood-waits. (Auto-tune may override this.) |
-| `CHROMA_DIR` | `chroma_db` | Directory where the ChromaDB vector database is stored. |
-| `COLLECTION_NAME` | `telegram_images` | Name of the ChromaDB collection holding the vectors. |
+| `CHROMA_DIR` | `chroma_db` | Directory where the vector store is kept (`vectors.sqlite3` + `hnsw.bin` + state files). The name is kept for compatibility with existing deployments. |
 | `TEMP_DIR` | `temp_images` | Scratch directory for images while they're being embedded; files are deleted afterward. |
 
 ---
@@ -159,3 +185,8 @@ User-sent files (search photos, image documents, and `/import` backups) are down
 
 - **"It keeps asking me to `/login` even though I set a session string."** You most likely pasted a **Pyrogram** session string, or put a string into `TELEGRAM_SESSION` (which is only a file *name*). Generate a **Telethon** string with `python generate_session.py` and put it in `TELETHON_STRING_SESSION`. Verify with `/session` — it should report `Mode: String session (env)` and `Auth: ✅`.
 - **"File is too big."** Ensure `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, and `BOT_TOKEN` are all set so the MTProto downloader can start.
+- **"Search results look wrong after I switched models."** Vectors from different CLIP models (or different preprocessing) are not comparable. The bot warns when the stored model fingerprint no longer matches the model on disk — run `/index` to rebuild the collection with the current model.
+- **"`/export` says the WAL checkpoint was busy."** A checkpoint could not complete because a reader was active (usually a long index run). The backup may be missing the newest transactions. Retry when indexing is idle.
+- **"`/import` says the backup has no model fingerprint."** The archive predates model tracking and may have been indexed with a different model or an older preprocessing version. Import works, but re-index for reliable results.
+- **"`/import` says the backup uses the old ChromaDB format."** Backups made before the storage migration can't be imported. Every such vector also predates the current model fingerprint, so they'd be rebuilt anyway — run `/index` to create a fresh store instead.
+- **"Botkeep: dependency installation failed; No space left on device."** Your host panel's disk quota is smaller than the dependency install. In the panel, set the environment variable `PIP_NO_CACHE_DIR=1` (stops pip from keeping a second copy of every downloaded wheel — the install then fits in roughly half the space), delete the stale `~/.cache/pip` folder via the panel's file manager to reclaim space from previous failed attempts, and consider switching to the `vit-b-32` model (85 MB instead of ~300 MB) if the quota remains tight. After one successful install the venv is cached and later boots skip the install entirely.

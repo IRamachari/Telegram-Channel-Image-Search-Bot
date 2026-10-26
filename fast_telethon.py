@@ -62,9 +62,16 @@ def _get_input_location(message):
         photo = media.photo
         if not photo:
             return None
+        # thumb_size="" is only valid for documents ("the whole document").
+        # For photos Telegram requires the `type` of the PhotoSize to download;
+        # an empty string yields FILE_ID_INVALID and every photo download fails.
+        from indexer import _pick_photo_size
+        thumb = _pick_photo_size(message)
+        if not thumb:
+            return None
         return InputPhotoFileLocation(
             id=photo.id, access_hash=photo.access_hash,
-            file_reference=photo.file_reference, thumb_size="",
+            file_reference=photo.file_reference, thumb_size=thumb,
         )
     if isinstance(media, MessageMediaDocument):
         doc = media.document

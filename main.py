@@ -11,7 +11,6 @@ logging.basicConfig(
 )
 logging.getLogger("telethon").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("chromadb").setLevel(logging.WARNING)
 logging.getLogger("onnxruntime").setLevel(logging.WARNING)
 
 log = logging.getLogger("main")

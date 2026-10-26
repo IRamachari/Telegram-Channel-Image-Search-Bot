@@ -37,6 +37,10 @@ from config import config
 
 log = logging.getLogger(__name__)
 
+# Prefix Telegram prepends to channel/supergroup ids in Bot-API style "marked"
+# ids (-100<id>). A real https://t.me/c/<id>/<msg> link must NOT contain it.
+_MARKED_PREFIX = "-100"
+
 
 # ── session discovery ───────────────────────────────────────────────────────
 
@@ -54,6 +58,26 @@ def user_session_available() -> bool:
     return has_string_session() or os.path.exists(config.SESSION_FILE)
 
 
+def warn_if_file_session_shared() -> None:
+    """
+    Warn when the on-disk session is used together with the monitor.
+
+    Every ephemeral client (indexer / estimate / cleanup) opens its own
+    SQLiteSession on the SAME ``.session`` file that the long-lived monitor
+    client holds. Two writers on one rollback-journal sqlite file can raise
+    "database is locked" mid-run, and the monitor's handle is never released.
+    A StringSession is in-memory per client and has no such contention, so it
+    is the recommended deployment for a monitor + indexer combination.
+    """
+    if not has_string_session() and os.path.exists(config.SESSION_FILE):
+        log.warning(
+            "Using the on-disk session %s: the monitor client and the "
+            "short-lived indexing clients share this sqlite file, which can "
+            "produce intermittent 'database is locked' errors. Set "
+            "TELETHON_STRING_SESSION to avoid the contention.",
+            config.SESSION_FILE)
+
+
 def session_location() -> str:
     """Human-readable description of where the user session is coming from."""
     if has_string_session():
@@ -61,20 +85,61 @@ def session_location() -> str:
     return config.SESSION_FILE
 
 
+def channel_url_id(channel_id) -> str:
+    """
+    Convert a (possibly Bot-API "marked") channel id into the integer that
+    belongs in a ``https://t.me/c/<id>/<msg>`` link.
+
+    Telegram marks channel/supergroup peer ids as ``-100<real_id>``; the public
+    message-link form drops that prefix entirely. Passing the marked id yields
+    a dead link (see core.telegram.org/api/links).
+    """
+    s = str(int(channel_id))
+    if s.startswith(_MARKED_PREFIX):
+        return s[len(_MARKED_PREFIX):]
+    return s.lstrip("-")
+
+
+def msg_link(entity, message_id: int) -> str:
+    """
+    Public deep link to a message in a channel. Public channels use their
+    username, private ones the ``/c/<unmarked-id>/<msg>`` form.
+    """
+    username = getattr(entity, "username", None)
+    if username:
+        return f"https://t.me/{username}/{message_id}"
+    return f"https://t.me/c/{channel_url_id(entity.id)}/{message_id}"
+
+
 # ── client builders ─────────────────────────────────────────────────────────
 
-def make_user_client() -> TelegramClient:
+def make_user_client(receive_updates: bool = True) -> TelegramClient:
     """
     Build (but do not connect) a Telethon client for the *user* account.
 
     Uses the StringSession from the environment when present, otherwise the
     on-disk session file. Either way it carries the same API_ID / API_HASH.
+
+    `receive_updates` defaults to True because the long-running ChannelMonitor
+    registers event handlers on its client. Ephemeral callers that only download
+    (the indexer's per-run client) should pass False to save bandwidth.
     """
     if has_string_session():
         session: object = StringSession(config.STRING_SESSION)
     else:
         session = config.SESSION_PATH
-    return TelegramClient(session, config.API_ID, config.API_HASH)
+    return TelegramClient(
+        session, config.API_ID, config.API_HASH,
+        # A 12-hour index run should not abort on the 6th connection blip.
+        connection_retries=10,
+        retry_delay=2,
+        # Let Telethon absorb short flood-waits in its own request retry loop
+        # rather than routing every one through the Python handler.
+        flood_sleep_threshold=120,
+        # Indexing thousands of entities in one process.
+        entity_cache_limit=20_000,
+        receive_updates=receive_updates,
+    )
 
 
 def make_bot_client() -> TelegramClient:

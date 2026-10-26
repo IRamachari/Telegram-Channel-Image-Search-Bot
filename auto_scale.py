@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import os
 import shutil
 
 import psutil
@@ -8,7 +9,10 @@ log = logging.getLogger(__name__)
 
 
 def detect_specs() -> dict:
-    cpu_count = psutil.cpu_count(logical=True)
+    # psutil.cpu_count() returns None when the topology can't be determined
+    # (common in restricted containers). Without the fallback, cpu//2 raises
+    # TypeError and /autotune fails with a bare error to the admin.
+    cpu_count = psutil.cpu_count(logical=True) or os.cpu_count() or 1
     cpu_physical = psutil.cpu_count(logical=False) or cpu_count
     mem = psutil.virtual_memory()
     disk = shutil.disk_usage("/")
@@ -27,9 +31,15 @@ def auto_tune(model_size_mb: float = 0) -> dict:
     ram = specs["ram_total_mb"]
     disk = specs["disk_free_mb"]
 
-    intra_threads = max(2, min(cpu // 2, 16))
-    inter_threads = max(1, min(cpu // 4, 8))
-
+    # ORT intra-op threads should follow the PHYSICAL core count: the docs state
+    # "INTRA Threads Total = Number of physical CPU Cores" and note that leaving
+    # intra_op_num_threads at 0 also enables affinitization. Dividing the logical
+    # count in half threw away ~half the available compute on the single hottest
+    # operation this bot performs. Conservative by design: the embedding pool is
+    # capped at 2 threads, so this never saturates a shared box.
+    cpu = specs["cpu_physical"]
+    intra_threads = max(2, min(cpu, 16))
+    inter_threads = 1
     if model_size_mb > 300:
         base_batch = 8
     elif model_size_mb > 100:
@@ -65,9 +75,15 @@ def auto_tune(model_size_mb: float = 0) -> dict:
     else:
         parallel = min(5, cpu)
 
+    # Recommendation only — the operator can always override with /model. The
+    # 336px variant is preferred whenever RAM allows because it is measurably
+    # more accurate than its 224px counterpart on fine detail.
     if ram >= 32768 and cpu >= 16:
         model = "vit-l-14"
         model_name = "ViT-L/14 (you have enough power)"
+    elif ram >= 2048:
+        model = "vit-l-14-336"
+        model_name = "ViT-L/14 @336px (best accuracy)"
     elif ram >= 4096:
         model = "vit-b-16"
         model_name = "ViT-B/16 (balanced)"

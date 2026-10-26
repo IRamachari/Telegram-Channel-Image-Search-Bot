@@ -8,7 +8,8 @@ from config import config
 
 
 def get_system_stats() -> dict:
-    cpu_count = psutil.cpu_count(logical=True)
+    # cpu_count() can be None in restricted containers; never print "None cores".
+    cpu_count = psutil.cpu_count(logical=True) or __import__("os").cpu_count() or 1
     cpu_pct = psutil.cpu_percent(interval=0.5)
     mem = psutil.virtual_memory()
     disk = shutil.disk_usage("/")
