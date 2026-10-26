@@ -61,21 +61,11 @@ AVAILABLE = {
         "crop": "center",
         "input": 336,
     },
-    # Chinese-CLIP: a proper CLIP trained on large-scale Chinese data. Its
-    # feature extractor resizes straight to (336,336) rather than resizing the
-    # shortest edge and cropping, hence crop="stretch".
-    "chinese-clip-l-336": {
-        "name": "Chinese-CLIP ViT-L/14 @336px",
-        "url": "https://huggingface.co/Xenova/chinese-clip-vit-large-patch14-336px/resolve/main/onnx/vision_model_quantized.onnx",
-        "size_mb": 307,
-        "ram_mb": 1800,
-        "accuracy": "⭐⭐⭐⭐ Multilingual",
-        "speed": "⚡ Slow",
-        "best_for": "CJK / multilingual channel content",
-        "min_instance": "Large (2-3 GB)",
-        "crop": "stretch",
-        "input": 336,
-    },
+    # NOTE: Chinese-CLIP is NOT offered. Its ONNX exports (Xenova org) are
+    # combined text+image graphs that require input_ids/attention_mask, and no
+    # vision-only export exists — verified against every Xenova chinese-clip
+    # repo. A URL pointing at a non-existent vision_model_quantized.onnx made
+    # /model fail with HTTP 404 for that entry.
 }
 
 

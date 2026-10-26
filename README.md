@@ -40,7 +40,6 @@ A self-hosted Telegram bot that indexes images from your Telegram channels and l
 | `vit-b-16` | CLIP ViT-B/16 | 110 MB | 500 MB | 224 px | Better detail, handles edits |
 | `vit-l-14` | CLIP ViT-L/14 | 350 MB | 1.2 GB | 224 px | High accuracy |
 | `vit-l-14-336` | CLIP ViT-L/14 @336 | 307 MB | 1.8 GB | 336 px | **Best general accuracy** |
-| `chinese-clip-l-336` | Chinese-CLIP ViT-L/14 | 307 MB | 1.8 GB | 336 px | Best for CJK / multilingual channels |
 
 Use `/model` to download and switch. The input resolution and crop mode are read
 from the model file (and the recorded model settings), so 224 px and 336 px models
