@@ -2,8 +2,15 @@
 from __future__ import annotations
 import argparse
 import asyncio
+import faulthandler
+import importlib
 import logging
 import sys
+
+# Print a Python-level stack trace on fatal signals (SIGSEGV, SIGBUS, …).
+# faulthandler writes straight to fd 2, so the trace survives even a hard
+# native crash that would otherwise leave the log without any output.
+faulthandler.enable()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -14,6 +21,23 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("onnxruntime").setLevel(logging.WARNING)
 
 log = logging.getLogger("main")
+
+
+def _preflight() -> None:
+    """
+    Import the native extensions one at a time with a stderr marker before each.
+
+    The bot's heavy dependencies are C extensions (onnxruntime, usearch,
+    numkong, cryptg, Pillow). If one of them segfaults at import, Python
+    cannot raise — the process just dies — and logging setup produces no
+    output yet. These flushed stderr markers, combined with faulthandler's
+    stack trace, pinpoint the failing module in a single restart.
+    """
+    for mod in ("numpy", "PIL", "onnxruntime", "usearch", "cryptg",
+                "telethon", "telegram"):
+        print(f"[preflight] importing {mod} …", file=sys.stderr, flush=True)
+        importlib.import_module(mod)
+    print("[preflight] all imports OK", file=sys.stderr, flush=True)
 
 
 def do_index(args):
@@ -30,6 +54,7 @@ def do_index(args):
 
 
 def do_bot(_):
+    _preflight()
     from bot import SearchBot
     SearchBot().run()
 
