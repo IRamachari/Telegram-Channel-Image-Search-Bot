@@ -502,6 +502,7 @@ class SearchBot:
             f"/export — download DB\n"
             f"/import — upload DB\n"
             f"/autotune — optimize\n"
+            f"/tune — manual override\n"
             f"/system — server stats\n"
             f"/stats — DB stats",
             parse_mode="Markdown",
@@ -561,6 +562,72 @@ class SearchBot:
         await asyncio.to_thread(apply_tune, self.embedder.model_size_mb)
         text = await asyncio.to_thread(format_auto_tune, self.embedder.model_size_mb)
         await update.message.reply_text(text + "\n✅ _Applied._", parse_mode="Markdown")
+
+    # ── /tune ─────────────────────────────────────────────────────────────────
+
+    async def cmd_tune(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """
+        Manual override of the auto-detected performance settings, persisted
+        in tune.json so it survives restarts (auto_scale loads the file at
+        import, so a fresh process applies the same values on first load).
+        """
+        if not _admin(update.effective_user.id):
+            return await update.message.reply_text("⛔")
+        from auto_scale import (_ALIASES, apply_tune, format_auto_tune,
+                                reset_tune, set_tune)
+        args = list(ctx.args or []) if ctx else []
+        usage = (
+            "⚙️ /tune — manual hardware tuning\n\n"
+            "/tune — show current settings\n"
+            "/tune intra=4 inter=1 batch=32 parallel=8\n"
+            "/tune reset — back to automatic\n\n"
+            "intra/inter: ONNX threads (1-32 / 1-8)\n"
+            "batch: images per embedding batch (1-256)\n"
+            "parallel: parallel downloads (1-32)"
+        )
+        wanted: dict = {}
+        do_reset = False
+        try:
+            for a in args:
+                if a.lower() == "reset":
+                    do_reset = True
+                    continue
+                k, sep, v = a.partition("=")
+                if not sep:
+                    raise ValueError(f"'{a}' is not key=value")
+                wanted[_ALIASES.get(k.lower(), k.lower())] = int(v)
+            if do_reset and wanted:
+                raise ValueError("reset cannot be combined with overrides")
+            if do_reset:
+                await asyncio.to_thread(reset_tune)
+            elif wanted:
+                await asyncio.to_thread(set_tune, **wanted)
+            # Re-apply so _applied reflects the overrides for this model size
+            # (set_tune only persists; apply_tune refreshes the live values).
+            applied = await asyncio.to_thread(
+                apply_tune, self.embedder.model_size_mb)
+        except ValueError as e:
+            return await update.message.reply_text(f"⚠️ {e}\n\n{usage}")
+        except Exception as e:
+            return await update.message.reply_text(f"⚠️ {e}")
+        # Thread counts are baked into the ONNX session at build time, so a
+        # changed intra/inter needs a session rebuild. Batch size and parallel
+        # downloads are read per-run and take effect immediately.
+        old = self.embedder._thread_tune
+        new = (applied.get("intra_threads", 4), applied.get("inter_threads", 1))
+        note = ""
+        if old != new:
+            if self.embedder.is_ready():
+                ok = await asyncio.to_thread(self.embedder.reload)
+                note = (
+                    f"\n✅ Model rebuilt with {new[0]} intra / {new[1]} inter threads."
+                    if ok else
+                    "\n⚠️ Model reload failed — previous session kept if any.")
+            else:
+                note = ("\nℹ️ No model loaded — threads apply at the next "
+                        "model load.")
+        text = await asyncio.to_thread(format_auto_tune, self.embedder.model_size_mb)
+        await update.message.reply_text(text + note, parse_mode="Markdown")
 
     # ── /cancel ───────────────────────────────────────────────────────────────
 
@@ -1534,6 +1601,7 @@ class SearchBot:
         app.add_handler(CommandHandler("system",        self.cmd_system))
         app.add_handler(CommandHandler("session",       self.cmd_session))
         app.add_handler(CommandHandler("autotune",      self.cmd_autotune))
+        app.add_handler(CommandHandler("tune",          self.cmd_tune))
         app.add_handler(CommandHandler("export",        self.cmd_export))
         app.add_handler(CommandHandler("duplicates",    self.cmd_duplicates))
         app.add_handler(CommandHandler("monitor",       self.cmd_monitor))

@@ -1,7 +1,10 @@
 from __future__ import annotations
+import json
 import logging
 import os
 import shutil
+import threading
+from pathlib import Path
 
 import psutil
 
@@ -115,11 +118,108 @@ def auto_tune(model_size_mb: float = 0) -> dict:
 
 _applied: dict = {}
 
+# ── Manual overrides (/tune) ─────────────────────────────────────────────────
+# Persisted in tune.json next to the code so they survive restarts. A typo
+# can't push ORT into spawning hundreds of threads or the downloader into
+# hammering Telegram's flood limits: every knob is bounded here.
+_OVERRIDE_FILE = Path(__file__).parent / "tune.json"
+_TUNE_KEYS = {
+    "intra_threads": (1, 32),
+    "inter_threads": (1, 8),
+    "batch_size": (1, 256),
+    "parallel_downloads": (1, 32),
+}
+_ALIASES = {
+    "intra": "intra_threads",
+    "intra_op": "intra_threads",
+    "inter": "inter_threads",
+    "inter_op": "inter_threads",
+    "batch": "batch_size",
+    "parallel": "parallel_downloads",
+    "dl": "parallel_downloads",
+}
+_tune_mu = threading.Lock()
+
+
+def _load_overrides() -> dict:
+    """Read tune.json, ignoring unknown/corrupt entries defensively."""
+    try:
+        data = json.loads(_OVERRIDE_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        log.warning("Ignoring corrupt %s: %s", _OVERRIDE_FILE, exc)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict = {}
+    for k, v in data.items():
+        k = _ALIASES.get(str(k).lower(), str(k).lower())
+        if k in _TUNE_KEYS and isinstance(v, int) and not isinstance(v, bool):
+            lo, hi = _TUNE_KEYS[k]
+            out[k] = max(lo, min(hi, v))
+    return out
+
+
+def _save_overrides() -> None:
+    tmp = _OVERRIDE_FILE.with_name(_OVERRIDE_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(_overrides, indent=2), encoding="utf-8")
+    os.replace(tmp, _OVERRIDE_FILE)
+
 
 def apply_tune(model_size_mb: float = 0) -> dict:
+    """Run auto_tune and lay manual /tune overrides on top of it."""
     global _applied
-    _applied = auto_tune(model_size_mb)
-    return _applied
+    with _tune_mu:
+        r = auto_tune(model_size_mb)
+        # Sorted list so the report is stable and the dict stays JSON-safe.
+        r["_manual"] = sorted(_overrides)
+        for k, v in _overrides.items():
+            r[k] = v
+        _applied = r
+        return r
+
+
+def set_tune(**kv) -> dict:
+    """
+    Validate + persist manual overrides. Raises ValueError on a bad key or
+    value; the caller is responsible for re-running apply_tune() afterwards.
+    """
+    global _overrides
+    with _tune_mu:
+        norm = {}
+        for k, v in kv.items():
+            k = _ALIASES.get(str(k).lower(), str(k).lower())
+            if k not in _TUNE_KEYS:
+                raise ValueError(f"unknown setting '{k}'")
+            if not isinstance(v, int) or isinstance(v, bool):
+                raise ValueError(f"'{k}' must be an integer")
+            lo, hi = _TUNE_KEYS[k]
+            if not lo <= v <= hi:
+                raise ValueError(f"'{k}' must be between {lo} and {hi}")
+            norm[k] = v
+        _overrides.update(norm)
+        _save_overrides()
+    return dict(_overrides)
+
+
+def reset_tune() -> None:
+    """Drop every manual override (and tune.json) — back to full auto."""
+    global _overrides
+    with _tune_mu:
+        _overrides = {}
+        try:
+            _OVERRIDE_FILE.unlink(missing_ok=True)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            log.warning("Could not remove %s: %s", _OVERRIDE_FILE, exc)
+
+
+# Loaded once at import: get_batch_size()/get_threads() consult _applied, which
+# apply_tune() fills — so a fresh process picks up persisted overrides on its
+# very first model load, with no explicit call needed.
+_overrides: dict = _load_overrides()
 
 
 def get_applied() -> dict:
@@ -142,10 +242,15 @@ def get_threads() -> tuple[int, int]:
 
 
 def format_auto_tune(model_size_mb: float = 0) -> str:
-    r = auto_tune(model_size_mb)
+    r = apply_tune(model_size_mb)
     s = r["specs"]
-    return (
-        "⚙️ *Auto\\-Tune Report*\n\n"
+    manual = set(r.get("_manual", ()))
+
+    def mark(k: str) -> str:
+        return " ✋" if k in manual else ""
+
+    text = (
+        "⚙️ *Tune Report*\n\n"
         "*Hardware Detected:*\n"
         f"  🖥 CPU: {s['cpu_physical']} cores / "
         f"{s['cpu_logical']} threads\n"
@@ -153,10 +258,14 @@ def format_auto_tune(model_size_mb: float = 0) -> str:
         f"({s['ram_avail_mb']:.0f} MB free)\n"
         f"  💿 Disk: {s['disk_free_mb']:.0f} MB free\n\n"
         "*Applied Settings:*\n"
-        f"  📦 Batch size: `{r['batch_size']}`\n"
-        f"  ⬇️ Parallel downloads: `{r['parallel_downloads']}`\n"
+        f"  📦 Batch size: `{r['batch_size']}`{mark('batch_size')}\n"
+        f"  ⬇️ Parallel downloads: `{r['parallel_downloads']}`"
+        f"{mark('parallel_downloads')}\n"
         f"  🔧 ONNX threads: `{r['intra_threads']}` intra / "
-        f"`{r['inter_threads']}` inter\n"
+        f"`{r['inter_threads']}` inter{mark('intra_threads')}\n"
         f"  🧠 Model: `{r['recommended_model_name']}`\n"
         f"  📸 Max images: ~{r['max_images_estimate']:,}\n"
     )
+    if manual:
+        text += "\n✋ manual override — /tune reset for full auto\n"
+    return text

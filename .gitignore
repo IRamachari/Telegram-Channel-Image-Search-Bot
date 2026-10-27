@@ -27,6 +27,9 @@ clip_visual.onnx
 # Which model is active (written by /model).
 model_state.json
 
+# Manual performance-tuning overrides (written by /tune) — machine-specific.
+tune.json
+
 # Scratch space for images being embedded.
 temp_images/
 

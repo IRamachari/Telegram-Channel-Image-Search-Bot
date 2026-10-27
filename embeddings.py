@@ -36,6 +36,10 @@ class CLIPEmbedder:
         self.session = None
         self.input_name = None
         self.model_size_mb = 0
+        # (intra, inter) the current session was built with; None until a
+        # load is attempted. /tune compares this to decide whether the
+        # session must be rebuilt for new thread counts to take effect.
+        self._thread_tune = None
         # Per-model preprocessing, resolved in _try_load().
         self.input_size = _DEFAULT_INPUT
         self.crop_mode = "center"
@@ -88,6 +92,9 @@ class CLIPEmbedder:
             intra, inter = get_threads()
         except Exception:
             intra, inter = 4, 2
+        # Record BEFORE building: /tune compares this even when the build
+        # below fails, so it can offer a retry once the file is fixed.
+        self._thread_tune = (intra, inter)
         try:
             log.info("Loading CLIP ONNX (%.0f MB) threads=%d/%d …",
                      self.model_size_mb, intra, inter)

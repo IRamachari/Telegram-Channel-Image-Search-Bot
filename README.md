@@ -71,6 +71,7 @@ override with `/model`.
 | `/stats` | Vector count per channel |
 | `/system` | Server CPU, RAM, and disk usage |
 | `/autotune` | Auto-optimize performance settings |
+| `/tune` | Manually override tuning: `intra=`, `inter=`, `batch=`, `parallel=`; `/tune reset` for auto |
 | `/export` | Download a backup of the database |
 | `/import` | Restore the database from a backup |
 | `/model` | Download and switch CLIP model |
