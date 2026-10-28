@@ -31,7 +31,14 @@ _MAX_SIDE = 8192
 # Orientation tag would change the pixels of every rotated photo, i.e. it is a
 # real pipeline change that must ship together with PREP_VERSION = 3 and a
 # forced full re-index — not as a silent drop-in at version 2.
-PREP_VERSION = 2
+#
+# PREP_VERSION history:
+#   1  full JPEG decode, BICUBIC resize, centre crop (original reliable
+#      behaviour).
+#   2  added Image.draft() fast decode -> reduced DCT precision -> less
+#      distinctive embeddings -> "always finds the wrong image". Reverted.
+#   3  back to full decode (this version). Re-index required.
+PREP_VERSION = 3
 
 # Fallback when the model declares nothing and the session shape is dynamic.
 _DEFAULT_INPUT = 224
@@ -223,15 +230,10 @@ class CLIPEmbedder:
             raise ValueError(
                 f"Image too large to embed: {w}x{h}px (limit {_MAX_SIDE}px/side)")
 
-        # 2. JPEG/MPO only: let libjpeg decode at a reduced DCT scale instead of
-        #    full resolution. MUST happen before any load/convert, after which it
-        #    is a no-op. Measured ~7x faster on 4032x3024 JPEG (81ms -> 12ms).
-        img.draft("RGB", (target, target))
-
-        # 3. `img.size` may have changed after draft() — re-read it.
-        #    NOTE: EXIF Orientation is deliberately ignored (see PREP_VERSION);
-        #    honouring it would change every rotated photo's embedding and so
-        #    requires a pipeline-version bump plus a full re-index.
+        # 2. Decode fully (no draft()). Image.draft() decodes JPEGs at a
+        #    reduced DCT scale which drops high-frequency detail and makes
+        #    embeddings less distinctive — that regression caused "always
+        #    finds the wrong image". Full decode matches the reliable v1.
         img = img.convert("RGB")
         if self.crop_mode == "stretch":
             img = img.resize((target, target), Image.BICUBIC, reducing_gap=2.0)
