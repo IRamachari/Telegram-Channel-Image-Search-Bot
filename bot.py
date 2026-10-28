@@ -270,6 +270,29 @@ class SearchBot:
             await tf.download_to_drive(custom_path=path)
             return path
 
+    async def _fetch_media_bytes(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                                 file_id: str, size_bytes: int = 0) -> bytes:
+        """
+        Get the bytes of a file the user just sent. Streams to a temp file first
+        (so a multi-GB photo never sits in RAM), then reads it back and deletes
+        it. Prefers MTProto (no size cap); falls back to the Bot API for small
+        files when MTProto is unavailable. Raises a clear error if a large file
+        can't be fetched.
+        """
+        import tempfile
+        fd, tmp = tempfile.mkstemp(prefix="media_", dir=config.TEMP_DIR)
+        os.close(fd)
+        try:
+            await self._fetch_media_to_path(
+                update, ctx, file_id, tmp, size_bytes=size_bytes)
+            with open(tmp, "rb") as fh:
+                return fh.read()
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
     # ── Startup hook ──────────────────────────────────────────────────────────
 
     async def _on_startup(self, app: Application) -> None:
@@ -1617,6 +1640,11 @@ class SearchBot:
                     parse_mode="Markdown")
             if count > 0 and self._app:
                 await self._update_pinned_message(self._app.bot)
+            if self._monitor is not None and getattr(self._monitor, "running", False):
+                try:
+                    await self._monitor.watch(ch)
+                except Exception as e:
+                    log.debug("Monitor hot-add failed: %s", e)
         except Exception as e:
             await _edit(msg, f"❌ `{e}`", parse_mode="Markdown")
 

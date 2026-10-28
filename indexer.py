@@ -645,6 +645,8 @@ class ChannelIndexer:
             try:
                 # No return_exceptions: a producer/consumer bug must fail the run.
                 await asyncio.gather(p, c)
+            except Exception as exc:
+                log.error("Index run failed: %s", exc, exc_info=True)
             finally:
                 # Cancel, then WAIT (bounded) so unwinding tasks finish their own
                 # finally blocks before this coroutine is torn down. Awaiting

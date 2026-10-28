@@ -70,12 +70,16 @@ def per_image_bytes(vector_dim: int = 768) -> int:
     overhead = 256
     multiplier = 1.5
     return int((bytes_per + overhead) * multiplier)
-    bytes_per = vector_dim * 4
-    overhead = 256
-    multiplier = 1.5
-    per_image = (bytes_per + overhead) * multiplier
+
+
+def estimate_space(photo_count: int, vector_dim: int = 768) -> dict:
+    """Estimate disk space needed for `photo_count` indexed images."""
+    per_image = per_image_bytes(vector_dim)
     total = photo_count * per_image
-    disk_free = shutil.disk_usage("/").free
+    try:
+        disk_free = shutil.disk_usage(config.CHROMA_DIR).free
+    except Exception:
+        disk_free = shutil.disk_usage("/").free
     return {
         "per_image_kb": per_image / 1024,
         "total_mb": total / 1024 / 1024,
