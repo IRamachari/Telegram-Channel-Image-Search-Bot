@@ -41,16 +41,27 @@ def _preflight() -> None:
 
 
 def do_index(args):
+    _preflight()
     from database import VectorDB
     from embeddings import CLIPEmbedder
     from indexer import ChannelIndexer
+    from models import mark_vectors_indexed
     db = VectorDB()
     emb = CLIPEmbedder()
     if not emb.is_ready():
         print("❌ No model. Run: python download_model.py")
         sys.exit(1)
     n = asyncio.run(ChannelIndexer(db, emb).index_channel(args.channel, limit=args.limit))
+    if n and n > 0:
+        try:
+            mark_vectors_indexed()
+        except Exception as exc:
+            log.warning("Could not record model fingerprint: %s", exc)
     print(f"✅ {n} images. Total: {db.count()}")
+    try:
+        db.close(wait=True)
+    except Exception:
+        pass
 
 
 def do_bot(_):

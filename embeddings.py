@@ -1,12 +1,13 @@
 from __future__ import annotations
 import logging
 import threading
+import time
 from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 import onnxruntime as ort
 
 log = logging.getLogger(__name__)
@@ -16,10 +17,16 @@ STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
 ONNX_PATH = Path(__file__).parent / "clip_visual.onnx"
 
 # Server-side guard for untrusted uploads. Pillow's built-in decompression-bomb
-# check only *warns* below 2x the limit, and the full-size resize below would
+# check only *warns* below 2x the limit; the full-size resize below would
 # allocate multiple GB for an image in the 89M-179M px band — an OOM kill here
-# takes down every other service on the box.
-_MAX_PIXELS = 89_478_485
+# takes down every other service on the box. Derived from available RAM so a
+# small box refuses huge images before decode instead of OOMing.
+try:
+    import psutil as _psutil
+    _avail_px = _psutil.virtual_memory().available // (4 * 3)
+    _MAX_PIXELS = min(89_478_485, max(4_000_000, _avail_px))
+except Exception:
+    _MAX_PIXELS = 89_478_485
 _MAX_SIDE = 8192
 
 # Version of the preprocessing pipeline. Changing the resize path (e.g. adding
@@ -27,18 +34,15 @@ _MAX_SIDE = 8192
 # embeddings. Bumping this invalidates every existing vector, so it is folded
 # into the model fingerprint to force the "re-index required" warning.
 #
-# Deliberately NOT applied here: ImageOps.exif_transpose(). Honouring the EXIF
-# Orientation tag would change the pixels of every rotated photo, i.e. it is a
-# real pipeline change that must ship together with PREP_VERSION = 3 and a
-# forced full re-index — not as a silent drop-in at version 2.
-#
 # PREP_VERSION history:
 #   1  full JPEG decode, BICUBIC resize, centre crop (original reliable
 #      behaviour).
 #   2  added Image.draft() fast decode -> reduced DCT precision -> less
 #      distinctive embeddings -> "always finds the wrong image". Reverted.
-#   3  back to full decode (this version). Re-index required.
-PREP_VERSION = 3
+#   3  back to full decode.
+#   4  honour EXIF Orientation via ImageOps.exif_transpose (rotated photos
+#      previously embedded sideways). Re-index required.
+PREP_VERSION = 4
 
 # Fallback when the model declares nothing and the session shape is dynamic.
 _DEFAULT_INPUT = 224
@@ -154,7 +158,7 @@ class CLIPEmbedder:
             if not ONNX_PATH.exists():
                 self.last_error = f"no model file at {ONNX_PATH}"
                 log.warning("No model file at %s", ONNX_PATH)
-                return self.is_ready()
+                return False
             size_mb = ONNX_PATH.stat().st_size / 1024 / 1024
             try:
                 from auto_scale import apply_tune, get_threads
@@ -164,6 +168,7 @@ class CLIPEmbedder:
                 intra, inter = 4, 1
             # Record BEFORE building: /tune compares this even when the build
             # below fails, so it can offer a retry once the file is fixed.
+            prev_tune = self._thread_tune
             self._thread_tune = (intra, inter)
             try:
                 log.info("Loading CLIP ONNX (%.0f MB) threads=%d/%d …",
@@ -177,10 +182,11 @@ class CLIPEmbedder:
                 name = session.get_inputs()[0].name
                 crop, input_size, mean, std, resample = self._resolve_settings(session)
             except Exception as exc:
+                self._thread_tune = prev_tune
                 self.last_error = str(exc)
                 log.error("Failed to load model (previous session kept): %s",
                           exc)
-                return self.is_ready()
+                return False
             # Commit — nothing above this line mutated the live session.
             self.session, self.input_name = session, name
             self.crop_mode, self.input_size = crop, input_size
@@ -221,8 +227,17 @@ class CLIPEmbedder:
     def get_dim(self) -> int:
         if not self.session:
             return 0
-        shape = self.session.get_outputs()[0].shape
-        return shape[-1] if shape else 0
+        outs = self.session.get_outputs()
+        names = [o.name for o in outs]
+        chosen = None
+        for preferred in ("image_embeds", "embedding", "pooler_output"):
+            if preferred in names:
+                chosen = outs[names.index(preferred)]
+                break
+        if chosen is None and outs:
+            chosen = outs[-1]
+        shape = chosen.shape if chosen is not None else None
+        return int(shape[-1]) if shape else 0
 
     def _preprocess(self, img):
         """
@@ -243,36 +258,38 @@ class CLIPEmbedder:
             raise ValueError(
                 f"Image too large to embed: {w}x{h}px (limit {_MAX_SIDE}px/side)")
 
-        # 2. Decode fully (no draft()). Image.draft() decodes JPEGs at a
-        #    reduced DCT scale which drops high-frequency detail and makes
-        #    embeddings less distinctive — that regression caused "always
-        #    finds the wrong image". Full decode matches the reliable v1.
+        # Honour EXIF Orientation so rotated photos are embedded upright.
+        img = ImageOps.exif_transpose(img)
         img = img.convert("RGB")
+        resample = (Image.LANCZOS if self.resample == 1
+                    else Image.BICUBIC if self.resample >= 3
+                    else Image.BILINEAR)
         if self.crop_mode == "stretch":
-            img = img.resize((target, target), Image.BICUBIC if self.resample >= 3 else Image.BILINEAR, reducing_gap=2.0)
+            img = img.resize((target, target), resample, reducing_gap=2.0)
         else:
             w, h = img.size
             if w < h:
                 nw, nh = target, int(h * target / w + 0.5)
             else:
                 nw, nh = int(w * target / h + 0.5), target
-            # reducing_gap only engages for large downscales; a free win then.
-            img = img.resize((nw, nh), Image.BICUBIC if self.resample >= 3 else Image.BILINEAR, reducing_gap=2.0)
+            img = img.resize((nw, nh), resample, reducing_gap=2.0)
             left = (nw - target) // 2
             top = (nh - target) // 2
             img = img.crop((left, top, left + target, top + target))
 
-        # np.asarray avoids Pillow's copy; in-place ops avoid two more temporaries.
         arr = np.asarray(img, dtype=np.float32)
         arr *= np.float32(1.0 / 255.0)
         arr -= self.mean
         arr /= self.std
-        # transpose() is a view; ascontiguousarray makes the actual (3,H,W) copy.
         return np.ascontiguousarray(arr.transpose(2, 0, 1))
 
     @staticmethod
     def _norm(v):
-        return v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-8)
+        v = np.asarray(v, dtype=np.float32)
+        if not np.all(np.isfinite(v)):
+            return v
+        nrm = np.linalg.norm(v, axis=-1, keepdims=True)
+        return v / np.maximum(nrm, 1e-8)
 
     def _run(self, batch, images=None):
         """
@@ -302,7 +319,7 @@ class CLIPEmbedder:
         # (e.g. SigLIP ships last_hidden_state + pooler_output). Fall back to
         # the last output, which is the pooled one for every model here.
         names = [o.name for o in session.get_outputs()]
-        for preferred in ("pooler_output", "image_embeds", "embedding"):
+        for preferred in ("image_embeds", "embedding", "pooler_output"):
             if preferred in names:
                 emb = outs[names.index(preferred)]
                 break
@@ -316,20 +333,21 @@ class CLIPEmbedder:
 
     def embed_path(self, path):
         self._check()
-        return self._run(None, [Image.open(path)]).flatten().tolist()
+        with Image.open(path) as im:
+            return self._run(None, [im]).flatten().tolist()
 
     def embed_bytes(self, data):
         self._check()
-        return self._run(None, [Image.open(BytesIO(data))]).flatten().tolist()
+        with Image.open(BytesIO(data)) as im:
+            return self._run(None, [im]).flatten().tolist()
 
     def embed_batch(self, paths):
         self._check()
         indices, images = [], []
         for i, p in enumerate(paths):
             try:
-                # Preprocess eagerly so the bomb guard fires here and the image
-                # is fully decoded before we hand it to the session.
-                images.append(self._preprocess(Image.open(p)))
+                with Image.open(p) as im:
+                    images.append(self._preprocess(im))
                 indices.append(i)
             except Exception as exc:
                 log.warning("Skip %s: %s", p, exc)

@@ -124,14 +124,16 @@ _REC_NOTES = {"siglip-large-patch16-384": "best retrieval quality",
               "vit-b-16": "balanced", "vit-b-32": "lightweight"}
 
 
-def _recommend(ram_mb: float, cpu: int) -> tuple[str, str]:
+def _recommend(ram_mb: float, cpu: int, ram_avail: float = 0.0) -> tuple[str, str]:
     from models import AVAILABLE
+    avail = ram_avail if ram_avail > 0 else ram_mb
     for key in _REC_ORDER:
         info = AVAILABLE[key]
-        # A ViT-L/14 on a single core is unusably slow, however much RAM it has.
-        if cpu < 2 and key.startswith("vit-l"):
+        if cpu < 2 and (key.startswith("vit-l") or key.startswith("siglip-large")):
             continue
-        if ram_mb >= info["ram_mb"] * _REC_HEADROOM:
+        # Large models need more headroom on low-RAM boxes.
+        headroom = 1.5 if info.get("ram_mb", 0) >= 1000 else _REC_HEADROOM
+        if avail >= info["ram_mb"] * headroom and ram_mb >= info["ram_mb"] * _REC_HEADROOM:
             return key, f"{info['name']} ({_REC_NOTES[key]})"
     info = AVAILABLE["vit-b-32"]
     return "vit-b-32", f"{info['name']} ({_REC_NOTES['vit-b-32']})"
@@ -162,13 +164,15 @@ def auto_tune(model_size_mb: float = 0) -> dict:
     else:
         base_batch = 64
 
-    if ram >= 16384:
+    ram_for_tiers = specs["ram_avail_mb"] if specs["ram_avail_mb"] > 0 else ram
+
+    if ram_for_tiers >= 16384:
         ram_mult = 4
-    elif ram >= 8192:
+    elif ram_for_tiers >= 8192:
         ram_mult = 2
-    elif ram >= 4096:
+    elif ram_for_tiers >= 4096:
         ram_mult = 1.5
-    elif ram >= 2048:
+    elif ram_for_tiers >= 2048:
         ram_mult = 1
     else:
         ram_mult = 0.5
@@ -179,18 +183,21 @@ def auto_tune(model_size_mb: float = 0) -> dict:
         power *= 2
     batch_size = power
 
-    if ram >= 8192 and cpu >= 8:
+    if ram_for_tiers >= 8192 and cpu >= 8:
         parallel = 15
-    elif ram >= 4096:
+    elif ram_for_tiers >= 4096:
         parallel = min(12, cpu)
-    elif ram >= 2048:
+    elif ram_for_tiers >= 2048:
         parallel = min(10, cpu)
-    elif ram >= 1024:
+    elif ram_for_tiers >= 1024:
         parallel = min(8, cpu)
     else:
         parallel = min(5, cpu)
 
-    model, model_name = _recommend(ram, cpu)
+    model, model_name = _recommend(ram, cpu, specs["ram_avail_mb"])
+
+    # ram_mult ladder uses available RAM to avoid over-committing on containers.
+    ram_for_tiers = specs["ram_avail_mb"] if specs["ram_avail_mb"] > 0 else ram
 
     # One image costs a 512-d float32 vector twice (SQLite blob + HNSW graph)
     # plus row/graph overhead — see system_info.per_image_bytes(). The old

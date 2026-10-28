@@ -28,7 +28,7 @@ A self-hosted Telegram bot that indexes images from your Telegram channels and l
 - **DB backup & restore** — export the full database as a zip and reimport it later (auto-split for large databases).
 - **Multiple CLIP models** — choose between faster smaller models or slower higher-accuracy ones.
 - **Auto-tune** — automatically adjusts batch size and parallelism based on available RAM.
-- **Up to 336px input** — the high-accuracy models embed at 336×336 instead of 224×224; the resolution is read from the model file itself, so no config change is needed. Chinese-CLIP is included for multilingual / CJK channel content.
+- **Up to 384px input** — the high-accuracy models embed at 336×336 or 384×384 instead of 224×224; the resolution is read from the model file itself, so no config change is needed. SigLIP/SigLIP2 models are included for stronger zero-shot retrieval.
 
 ---
 
@@ -39,7 +39,7 @@ A self-hosted Telegram bot that indexes images from your Telegram channels and l
 | `vit-b-32` | CLIP ViT-B/32 | 85 MB | 350 MB | 224 px | Fastest, general use |
 | `vit-b-16` | CLIP ViT-B/16 | 83 MB | 500 MB | 224 px | Better detail, handles edits |
 | `vit-l-14` | CLIP ViT-L/14 | 293 MB | 1.2 GB | 224 px | High accuracy |
-| `vit-l-14-336` | CLIP ViT-L/14 @336 | 307 MB | 1.8 GB | 336 px | **Best general accuracy (CLIP)** |
+| `vit-l-14-336` | CLIP ViT-L/14 @336 | 293 MB | 1.8 GB | 336 px | **Best general accuracy (CLIP)** |
 | `siglip-base-patch16-224` | SigLIP Base/16 | 95 MB | 400 MB | 224 px | Stronger retrieval, fast, small servers |
 | `siglip-large-patch16-384` | SigLIP Large/16 @384 | 314 MB | 1.4 GB | 384 px | **Highest retrieval quality** |
 | `siglip2-base-patch16-224` | SigLIP2 Base/16 | 90 MB | 400 MB | 224 px | Newer SigLIP2, fast, small servers |

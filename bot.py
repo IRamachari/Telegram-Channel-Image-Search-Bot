@@ -328,7 +328,7 @@ class SearchBot:
                             "Search results are unreliable until you `/index` again.",
                             parse_mode="Markdown")
             except Exception as e:
-                log.debug("Model fingerprint check failed: %s", e)
+                log.warning("Model fingerprint check failed: %s", e)
 
             # The monitor and the ephemeral indexing clients contend on a
             # file-based Telethon session; make it visible before it bites.
@@ -444,7 +444,7 @@ class SearchBot:
             self._mtproto = None
 
         try:
-            self.db.close()
+            await asyncio.to_thread(self.db.close, True, 10.0)
         except Exception:
             pass
 
@@ -584,6 +584,20 @@ class SearchBot:
     async def cmd_stats(self, update: Update, _):
         n = self.db.count()
         ch = self.db.list_channels()
+        # Fallback: derive distinct channel ids from vectors when watermarks
+        # are missing, so the bot still reports channels that exist in the DB.
+        if not ch and n > 0:
+            try:
+                ids, metas = self.db.paged_get(include=["metadatas"])
+                seen = set()
+                for m in metas:
+                    cid = m.get("channel_id") if isinstance(m, dict) else None
+                    if cid is not None:
+                        seen.add(str(cid))
+                if seen:
+                    ch = {c: 0 for c in seen}
+            except Exception:
+                pass
         lines = [f"📊 *{n:,}* vectors\n"]
         for c, w in ch.items():
             lines.append(f"  • `{c}` → `{w}`")
@@ -856,12 +870,13 @@ class SearchBot:
         await q.edit_message_text(f"⬇️ *{info['name']}* …", parse_mode="Markdown")
         try:
             r = await asyncio.to_thread(models.download_model, key)
+            if self.embedder.is_busy():
+                raise RuntimeError("an index run started during download; model not switched")
             reloaded = self.embedder.reload()
             from auto_scale import apply_tune
             apply_tune(self.embedder.model_size_mb)
             if not reloaded:
                 raise RuntimeError(self.embedder.last_error or "model reload failed")
-            # Record the new fingerprint only once the model is live on disk.
             models.write_model_fingerprint()
             if old and old != key and self.db.count() > 0:
                 w = ("\n\n⚠️ *Model changed* - existing vectors are not comparable.\n"
@@ -974,7 +989,7 @@ class SearchBot:
         # otherwise each /import leaks them.
         if old_db is not None and old_db is not self.db:
             try:
-                old_db.close()
+                old_db.close(wait=True, timeout=10.0)
             except Exception:
                 pass
         self.searcher = ImageSearcher(self.db, self.embedder)
@@ -1657,6 +1672,8 @@ class SearchBot:
 
         app.add_handler(CommandHandler("start",         self.cmd_start))
         app.add_handler(CommandHandler("stats",         self.cmd_stats))
+        app.add_handler(CommandHandler("channels",      self.cmd_stats))
+        app.add_handler(CommandHandler("status",        self.cmd_stats))
         app.add_handler(CommandHandler("system",        self.cmd_system))
         app.add_handler(CommandHandler("session",       self.cmd_session))
         app.add_handler(CommandHandler("autotune",      self.cmd_autotune))

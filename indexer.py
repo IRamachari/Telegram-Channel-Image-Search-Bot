@@ -163,10 +163,11 @@ async def _resolve_numeric(client, value):
     """Resolve an id, priming the entity cache if the id is not known yet."""
     try:
         return await client.get_entity(value)
-    except (TypeError, ValueError):
+    except Exception:
         # A bare id is only resolvable when its access_hash is cached. A
         # StringSession persists no entities, so in a fresh process this fails
-        # until one dialog-list pass has filled the cache.
+        # until one dialog-list pass has filled the cache. Broaden the catch so
+        # transient FloodWait/other errors also trigger a cache prime + retry.
         from tg_client import prime_entity_cache
         await prime_entity_cache(client)
         return await client.get_entity(value)
@@ -352,7 +353,7 @@ class ChannelIndexer:
 
     async def _fast_index(self, client, entity, limit, progress_cb, concurrency):
         ch_id = entity.id
-        wm = self.db.get_watermark(ch_id)
+        _active_runs.add(int(ch_id))
         actual_batch = _get_batch_size()
         cur_c = min(concurrency, 8)
         # min_c must never exceed max_c: with concurrency < 3 the old
@@ -374,18 +375,17 @@ class ChannelIndexer:
         # that was still queued below it. We therefore only ever advance the
         # watermark across a gap-free prefix of what has actually been flushed.
         pending: set[int] = set()   # produced by the producer, not yet persisted
+        failed: set[int] = set()    # produced but could not be embedded (skip)
         produced_max = [wm]         # highest message id the producer has seen
 
         def _safe_watermark() -> int:
             # Only messages that WILL be persisted hold the watermark back.
-            #
-            # Deliberately NOT included: messages whose download failed. Holding
-            # the watermark below a dead message would make every later sync
-            # re-download the whole channel from that point, which is a far
-            # worse outcome than skipping one image (matching the existing
-            # errors/skipped semantics). Such a message is simply skipped.
-            if pending:
-                return min(pending) - 1
+            # Messages that failed to embed are tracked separately and do not
+            # hold the gap-free prefix (otherwise one bad image pins the
+            # watermark below it forever).
+            effective = pending - failed
+            if effective:
+                return min(effective) - 1
             return produced_max[0]
 
         def _reject(msg_id, tmp_path) -> None:
@@ -446,7 +446,7 @@ class ChannelIndexer:
                         # bad wait can't wedge the run forever), then retry once.
                         await asyncio.sleep(min(max(e.seconds, 1), 300))
                         try:
-                            await msg.download_media(file=tmp)
+                            await msg.download_media(file=tmp, thumb=thumb)
                         except Exception:
                             stats.errors += 1
                             _reject(msg.id, tmp)
@@ -532,9 +532,7 @@ class ChannelIndexer:
                 log.error("Producer: %s", exc, exc_info=True)
                 raise
             finally:
-                # Wait for outstanding downloads. Shielded so a cancellation
-                # arriving while we unwind does not orphan the dl_one tasks
-                # (asyncio only holds weak references to them).
+                # Wait for outstanding downloads...
                 if tasks:
                     try:
                         await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
@@ -566,7 +564,7 @@ class ChannelIndexer:
             # 300 s) plus its own per-download flood sleeps, so a long enough
             # chained gap would otherwise make the consumer "time out" first —
             # after which the producer blocks forever on a full queue.
-            idle_timeout = 3600
+            idle_timeout = 7200
             try:
                 while True:
                     try:
@@ -586,9 +584,18 @@ class ChannelIndexer:
                         stats.embedded += len(persisted)
                         # Only messages that actually produced a vector may be
                         # released: a row whose embedding was None is still
-                        # unpersisted and must keep the watermark back.
-                        for mid in persisted:
-                            pending.discard(mid)
+                        # unpersisted. Track those as failed so they don't pin
+                        # the watermark forever, but still remove them from pending.
+                        batch_msg_ids = [m.get("message_id") for m in bm]
+                        persisted_set = set(persisted)
+                        for mid in batch_msg_ids:
+                            if mid is None:
+                                continue
+                            if mid in persisted_set:
+                                pending.discard(mid)
+                            else:
+                                failed.add(mid)
+                                pending.discard(mid)
                         await _commit_watermark()
                         log.info("  +%d total=%d %.1f/s %.1fMB %ds c=%d",
                                  len(persisted), stats.embedded, stats.speed,
@@ -647,6 +654,17 @@ class ChannelIndexer:
                     t.cancel()
                 await asyncio.wait({p, c, h}, timeout=10)
 
+        # Commit the watermark even when no vectors were produced, so the
+        # channel is recorded as indexed (empty runs must still register).
+        try:
+            await _commit_watermark()
+        except Exception:
+            pass
+        try:
+            await asyncio.to_thread(self.db.flush_state, 10.0)
+        except Exception:
+            pass
+
         log.info("DONE emb=%d skip=%d err=%d flood=%d %.1fMB %.1f/s %ds DB=%d",
                  stats.embedded, stats.skipped, stats.errors, stats.flood_waits,
                  stats.mb_downloaded, stats.speed, stats.elapsed, self.db.count())
@@ -655,6 +673,7 @@ class ChannelIndexer:
                 models.mark_vectors_indexed()
             except Exception as exc:
                 log.warning("Could not record model fingerprint: %s", exc)
+        _active_runs.discard(int(ch_id))
         return stats.embedded
 
     def _flush(self, ids, paths, metas):

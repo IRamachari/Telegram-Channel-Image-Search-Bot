@@ -64,7 +64,12 @@ def _bar(pct, width=20):
     return f"{icon} `[{'█' * filled}{'░' * empty}]` {pct:.0f}%"
 
 
-def estimate_space(photo_count, vector_dim=768):
+def per_image_bytes(vector_dim: int = 768) -> int:
+    """Bytes one indexed image costs (vector blob + HNSW + row overhead)."""
+    bytes_per = vector_dim * 4
+    overhead = 256
+    multiplier = 1.5
+    return int((bytes_per + overhead) * multiplier)
     bytes_per = vector_dim * 4
     overhead = 256
     multiplier = 1.5

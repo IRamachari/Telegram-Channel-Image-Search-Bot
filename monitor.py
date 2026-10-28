@@ -3,40 +3,30 @@ Channel monitor — watches indexed channels for:
   - New images → auto-embed
   - Deleted messages → remove vectors
 """
-
 from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 from pathlib import Path
 
 from telethon import TelegramClient, events
 from telethon.tl.types import (
-    MessageMediaPhoto,
-    MessageMediaDocument,
     UpdateDeleteChannelMessages,
-    PeerChannel,
 )
 
 from config import config
 from database import VectorDB
 from embeddings import CLIPEmbedder
 import tg_client
-from tg_client import msg_link
+from tg_client import msg_link, prime_entity_cache, make_user_client
+import media
+from media import is_image as media_is_image, download_thumb_type
 
 log = logging.getLogger(__name__)
 
 
 def _is_image(msg) -> bool:
-    if not msg or not msg.media:
-        return False
-    if isinstance(msg.media, MessageMediaPhoto):
-        return True
-    if isinstance(msg.media, MessageMediaDocument):
-        doc = msg.media.document
-        return doc and getattr(doc, "mime_type", "").startswith("image/")
-    return False
+    return media_is_image(msg)
 
 
 def _msg_link(entity, msg_id):
@@ -44,7 +34,6 @@ def _msg_link(entity, msg_id):
 
 
 def _md(text) -> str:
-    """Escape dynamic text for Telegram's legacy Markdown (v1) escape set."""
     out = str(text)
     for ch, esc in (("_", "\\_"), ("*", "\\*"), ("`", "\\`"), ("[", "\\[")):
         out = out.replace(ch, esc)
@@ -52,7 +41,6 @@ def _md(text) -> str:
 
 
 def _unmarked(channel_id) -> int:
-    """Strip Telegram's -100 marked-id prefix so ids match the indexer."""
     from tg_client import channel_url_id
     try:
         return int(channel_url_id(channel_id))
@@ -65,34 +53,18 @@ class ChannelMonitor:
                  db_lock: asyncio.Lock | None = None) -> None:
         self.db = db
         self.embedder = embedder
-        # Shared write lock — passed from SearchBot so the monitor, indexer,
-        # and cleanup never hit ChromaDB/SQLite concurrently.
         self._db_lock: asyncio.Lock = db_lock or asyncio.Lock()
         self.client: TelegramClient | None = None
         self.running = False
         self._watch_ids: set[int] = set()
-        self._stats = {
-            "new_images": 0,
-            "deleted_images": 0,
-            "errors": 0,
-        }
+        self._stats = {"new_images": 0, "deleted_images": 0, "errors": 0}
         self._notify_callback = None
-        # Telethon dispatches event handlers sequentially on the loop. If a
-        # handler awaits the DB write lock inline, a long index run starves the
-        # dispatcher (and with it the MTProto pings) for hours. DB writes are
-        # therefore handed to a tracked background task.
         self._bg: set[asyncio.Task] = set()
         self._keep_alive_task: asyncio.Task | None = None
         Path(config.TEMP_DIR).mkdir(parents=True, exist_ok=True)
 
-    # ── helpers ──────────────────────────────────────────────────────────────
-
     def _spawn(self, coro) -> None:
-        """Fire-and-forget task with a strong reference (see asyncio docs)."""
         if not self.running:
-            # Refuse work once stop() has begun: a task spawned after _bg was
-            # cleared would hold no strong reference and could be GC'd, and would
-            # write a vector the operator just asked to stop.
             coro.close()
             return
         t = asyncio.create_task(coro)
@@ -104,11 +76,6 @@ class ChannelMonitor:
         return dict(self._stats)
 
     async def start(self, notify_callback=None) -> str:
-        """
-        Start monitoring all indexed channels.
-        notify_callback(text) is called on new/deleted events.
-        Returns a status message.
-        """
         if self.running:
             return "Already running."
 
@@ -116,7 +83,7 @@ class ChannelMonitor:
         if not channels:
             return "No channels indexed. /index first."
 
-        from tg_client import user_session_available, make_user_client
+        from tg_client import user_session_available
         if not user_session_available():
             return "No session. /login first."
 
@@ -128,7 +95,9 @@ class ChannelMonitor:
             await self.client.disconnect()
             return "Session expired. /login again."
 
-        # resolve channel IDs
+        # Prime the entity cache so bare channel ids resolve under StringSession.
+        await prime_entity_cache(self.client)
+
         self._watch_ids = set()
         ch_names = {}
         for ch_id_str in channels:
@@ -144,8 +113,12 @@ class ChannelMonitor:
             await self.client.disconnect()
             return "No channels could be resolved."
 
-        @self.client.on(events.NewMessage(chats=list(self._watch_ids)))
+        # Register handlers WITHOUT a chats filter so channels indexed later
+        # (hot-add) are picked up without re-registering.
+        @self.client.on(events.NewMessage())
         async def on_new(event):
+            if _unmarked(getattr(event, "chat_id", 0)) not in self._watch_ids:
+                return
             await self._handle_new(event)
 
         @self.client.on(events.Raw(types=[UpdateDeleteChannelMessages]))
@@ -158,9 +131,6 @@ class ChannelMonitor:
         names = ", ".join(ch_names.values())
         log.info("Monitor started for: %s", names)
 
-        # Telethon already pings MTProto itself; this is a liveness *watchdog*
-        # that detects a dead socket and reconnects. The task reference is kept
-        # (the event loop only holds weak references) and cancelled in stop().
         self._keep_alive_task = asyncio.create_task(self._watchdog())
         self._keep_alive_task.add_done_callback(lambda t: self._task_died("watchdog", t))
 
@@ -175,12 +145,6 @@ class ChannelMonitor:
             self._stats["errors"] += 1
 
     async def _watchdog(self):
-        """
-        Telethon's own keep-alive pings MTProto every 60 s; ``is_connected()``
-        is only a user-set flag and cannot detect a dead socket. This loop
-        probes the connection and reconnects when it has silently dropped —
-        otherwise the monitor stays "Running" while nothing is indexed.
-        """
         while self.running and self.client:
             try:
                 await asyncio.sleep(60)
@@ -207,7 +171,6 @@ class ChannelMonitor:
 
     async def stop(self) -> str:
         if not self.running:
-            # Still make sure a client isn't left connected.
             if self.client is not None:
                 try:
                     await self.client.disconnect()
@@ -215,19 +178,13 @@ class ChannelMonitor:
                     pass
                 self.client = None
             return "Not running."
-        # Flip the flag FIRST: _handle_new/_handle_delete and _spawn consult it,
-        # so no new work can start once teardown begins.
         self.running = False
 
-        # Cancel the watchdog before anything else: its old finally clause used
-        # to reset running=False and keep a reference to a dead client.
         if self._keep_alive_task is not None:
             self._keep_alive_task.cancel()
             try:
                 await self._keep_alive_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
+            except (asyncio.CancelledError, Exception):
                 pass
             self._keep_alive_task = None
 
@@ -250,16 +207,25 @@ class ChannelMonitor:
             f"❌ Errors: {self._stats['errors']}"
         )
 
+    async def watch(self, channel_id) -> bool:
+        """Hot-add a channel to a running monitor without restart."""
+        if not self.running or self.client is None:
+            return False
+        try:
+            await prime_entity_cache(self.client)
+            entity = await self.client.get_entity(int(channel_id))
+            self._watch_ids.add(entity.id)
+            log.info("Monitor hot-added channel %s", getattr(entity, "title", channel_id))
+            return True
+        except Exception as exc:
+            log.warning("Monitor hot-add failed for %s: %s", channel_id, exc)
+            return False
+
     async def _handle_new(self, event):
-        """
-        Auto-embed new images. Downloads and embeds inline (slow, but harmless),
-        then hands the DB write to a background task so Telethon's dispatcher is
-        never blocked by the write lock for the duration of an index run.
-        """
         if not self.running:
             return
         msg = event.message
-        if not _is_image(msg):
+        if not media_is_image(msg):
             return
         if not self.embedder.is_ready():
             return
@@ -267,15 +233,14 @@ class ChannelMonitor:
         tmp = None
         try:
             entity = await event.get_chat()
-            # event.chat_id is a Bot-API style *marked* id (-100…). Everywhere
-            # else the pipeline uses the unmarked entity.id; using the marked id
-            # here produced duplicate doc-ids and a watermark the indexer never
-            # reads.
             ch_id = _unmarked(entity.id)
+            if ch_id not in self._watch_ids:
+                return
             doc_id = f"{ch_id}_{msg.id}"
             tmp = os.path.join(config.TEMP_DIR, f"{doc_id}.jpg")
 
-            await msg.download_media(file=tmp)
+            thumb = download_thumb_type(msg)
+            await msg.download_media(file=tmp, thumb=thumb)
             if not os.path.isfile(tmp) or os.path.getsize(tmp) == 0:
                 return
 
@@ -306,9 +271,6 @@ class ChannelMonitor:
     async def _persist_new(self, doc_id, emb, meta, ch_id, msg_id, title):
         try:
             async with self._db_lock:
-                # Self-heal rows written by the old (marked-id) code path so a
-                # single image can never be indexed twice under both ids.
-                # Deleting an id that does not exist is a no-op.
                 self.db.delete([f"-100{ch_id}_{msg_id}"])
                 self.db.upsert([doc_id], [emb], [meta])
                 if self.db.get_watermark(ch_id) < msg_id:
@@ -329,20 +291,26 @@ class ChannelMonitor:
             log.error("Monitor persist error: %s", exc)
 
     async def _handle_delete(self, event):
-        """Remove vectors for deleted messages — serialised via _db_lock."""
         if not self.running:
             return
         if not hasattr(event, "channel_id") or not hasattr(event, "messages"):
             return
 
         ch_id = _unmarked(event.channel_id)
-        if ch_id not in self._watch_ids:
-            return
+        # Resolve via DB membership rather than _watch_ids, so deletes for
+        # channels that are indexed but not actively watched still get cleaned.
+        try:
+            if not self.db.get_ids_for_channel(ch_id):
+                # fall back: allow if in watch set
+                if ch_id not in self._watch_ids:
+                    return
+        except Exception:
+            if ch_id not in self._watch_ids:
+                return
 
         deleted_ids = [f"{ch_id}_{msg_id}" for msg_id in event.messages]
 
         if deleted_ids:
-            # Hand off instead of awaiting the lock inline (see _handle_new).
             self._spawn(self._persist_delete(ch_id, deleted_ids))
 
     async def _persist_delete(self, ch_id, deleted_ids):
@@ -364,11 +332,8 @@ class ChannelMonitor:
             log.error("Monitor delete error: %s", exc)
 
     async def cleanup_channel(self, channel_input, progress_callback=None) -> dict:
-        """
-        Check all indexed messages — remove vectors for deleted ones.
-        """
         from tg_client import make_user_client
-        client = make_user_client()
+        client = make_user_client(ephemeral=True)
         await client.connect()
         if not await client.is_user_authorized():
             await client.disconnect()
@@ -377,7 +342,7 @@ class ChannelMonitor:
         try:
             from indexer import resolve_channel
             entity = await resolve_channel(client, channel_input)
-            ch_id = entity.id
+            ch_id = _unmarked(entity.id)
             ch_name = getattr(entity, "title", str(ch_id))
 
             indexed = self.db.get_ids_for_channel(ch_id)
@@ -416,10 +381,8 @@ class ChannelMonitor:
                         pass
 
             if to_delete:
-                # ── serialised write ──────────────────────────────────────────
                 async with self._db_lock:
                     self.db.delete(to_delete)
-                # ─────────────────────────────────────────────────────────────
                 log.info("Cleanup: removed %d from %s", len(to_delete), ch_name)
 
             return {

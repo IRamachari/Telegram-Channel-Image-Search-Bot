@@ -9,7 +9,17 @@ load_dotenv(PROJECT_DIR / ".env")
 
 
 def _int_list(raw: str) -> list[int]:
-    return [int(x.strip()) for x in raw.split(",") if x.strip()]
+    out = []
+    for x in raw.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            out.append(int(x))
+        except ValueError:
+            log = __import__("logging").getLogger(__name__)
+            log.warning("Ignoring non-integer ADMIN_IDS entry: %r", x)
+    return out
 
 
 @dataclass(frozen=True)

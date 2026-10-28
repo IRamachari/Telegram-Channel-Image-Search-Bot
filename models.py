@@ -150,9 +150,12 @@ def model_settings(key: str) -> dict:
 def get_active_model() -> str | None:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text()).get("active")
-        except Exception:
-            return None
+            data = json.loads(STATE_FILE.read_text())
+            if isinstance(data, dict):
+                return data.get("active")
+            log.warning("model_state.json is not a JSON object")
+        except Exception as exc:
+            log.warning("Unreadable model_state.json: %s", exc)
     return None
 
 
@@ -184,7 +187,12 @@ def set_active_model(key: str) -> None:
 
 
 def is_model_downloaded() -> bool:
-    return ONNX_PATH.exists()
+    if not ONNX_PATH.exists():
+        return False
+    try:
+        return ONNX_PATH.stat().st_size >= MIN_MODEL_BYTES
+    except OSError:
+        return False
 
 
 def model_file_size_mb() -> float:
@@ -231,6 +239,7 @@ def _resume_download(url: str, dest: Path, expected: int, progress=None) -> None
         have = 0
     if expected and have == expected:
         return                      # already complete — the caller verifies it
+    deadline = time.monotonic() + 600  # 10 min overall budget
     req = urllib.request.Request(url)
     if have:
         req.add_header("Range", f"bytes={have}-")
@@ -251,6 +260,8 @@ def _resume_download(url: str, dest: Path, expected: int, progress=None) -> None
         with open(dest, "ab" if have else "wb") as fh:
             done = have
             while True:
+                if time.monotonic() > deadline:
+                    raise RuntimeError("download deadline exceeded")
                 chunk = resp.read(_CHUNK)
                 if not chunk:
                     break
@@ -346,6 +357,7 @@ def download_model(key: str, progress=None) -> str:
     except Exception as exc:
         raise RuntimeError(f"Download failed: {exc}")
     set_active_model(key)
+    write_model_fingerprint()
     size = model_file_size_mb()
     return f"✅ {info['name']} downloaded ({size:.0f} MB, sha256 verified)"
 
@@ -514,7 +526,7 @@ def model_status() -> dict:
 
 def model_changed() -> bool:
     """True when the on-disk model differs from the one the vectors came from."""
-    return model_status()["state"] in ("mismatch", "unreadable")
+    return model_status()["state"] in ("mismatch", "unreadable", "missing")
 
 
 def format_model_card(key: str) -> str:
