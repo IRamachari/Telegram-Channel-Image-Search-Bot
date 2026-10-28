@@ -38,6 +38,17 @@ class Config:
     )
 
     @property
+    def admins_configured(self) -> bool:
+        """
+        True when at least one admin is configured.
+
+        An empty ADMIN_IDS used to mean "every user is an admin", which handed
+        /login (it rewrites the session file), /import and /export to anyone.
+        The bot now fails closed and refuses to start without an admin.
+        """
+        return bool(self.ADMIN_IDS)
+
+    @property
     def SESSION_PATH(self) -> str:
         return str(PROJECT_DIR / self.SESSION_NAME)
 

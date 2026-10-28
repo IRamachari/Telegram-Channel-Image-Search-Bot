@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import io as io_module
 import logging
+import os
 import re
 import time
 from datetime import datetime
@@ -32,16 +33,35 @@ IMPORT_WAITING = 20
 
 # A valid backup part is exactly what export_db() produces:
 #   backup_<label>_<YYYYMMDD>_<HHMMSS>.partNNofMM
+# Part numbers are unbounded: a store large enough for >99 parts is possible,
+# and the old \d{2} made such an export impossible to import.
 _BACKUP_PART_RE = re.compile(
-    r"^backup_.+_\d{8}_\d{6}.part\d{2}of\d{2}$", re.IGNORECASE)
+    r"^backup_.+_\d{8}_\d{6}\.part\d+of\d+$", re.IGNORECASE)
+
+# /import staging limits. Parts are streamed to TEMP_DIR instead of being kept
+# in RAM; these caps stop a runaway upload from filling the disk before `done`.
+_IMPORT_MAX_PARTS = 400
+_IMPORT_MAX_BYTES = 16 * 1024 ** 3
+# db_manager still accepts the archive as bytes, so the final hand-off must fit
+# in memory. Refuse anything larger with a clear message instead of OOMing.
+_IMPORT_MAX_HANDOFF_BYTES = 2 * 1024 ** 3
 
 
 def _looks_like_backup_part(name: str) -> bool:
     return bool(name) and bool(_BACKUP_PART_RE.match(name.strip()))
 
 
+def _cap_lines(lines: list[str], limit: int) -> list[str]:
+    """Keep generated messages below Telegram's 4096-character ceiling."""
+    if len(lines) <= limit:
+        return lines
+    return lines[:limit] + [f"  … +{len(lines) - limit} more"]
+
+
 def _admin(uid):
-    return not config.ADMIN_IDS or uid in config.ADMIN_IDS
+    # Fail closed: an empty ADMIN_IDS used to grant every command — including
+    # /login, which rewrites the operator's session file — to every user.
+    return config.admins_configured and uid in config.ADMIN_IDS
 
 
 def _esc(value, default: str = "") -> str:
@@ -122,10 +142,15 @@ class SearchBot:
         self._tasks: set[asyncio.Task] = set()
         self._dup_cache: dict[int, list] = {}
         self._monitor = None
-        self._import_parts: dict[int, list[bytes]] = {}
+        # /import staging: uid -> [(temp_path, original_name)]. Parts live on
+        # disk, never in RAM, so a multi-GB backup cannot OOM the process.
+        self._import_parts: dict[int, list[tuple[str, str]]] = {}
         self._app: Application | None = None
         # Pinned message registry persisted across restarts: {str(chat_id): message_id}
         self._pinned: dict[str, int] = _state.get("pinned", {})
+        if not isinstance(self._pinned, dict):
+            self._pinned = {}
+        os.makedirs(config.TEMP_DIR, exist_ok=True)
         # Serialise ALL ChromaDB writes — prevents "database is locked" errors
         self._db_lock: asyncio.Lock = asyncio.Lock()
         # Excludes /import (which replaces the chroma_db directory on disk) from
@@ -170,6 +195,7 @@ class SearchBot:
                 log.warning("MTProto downloader unavailable: set TELEGRAM_API_ID, "
                             "TELEGRAM_API_HASH and BOT_TOKEN to download files >20 MB.")
                 return None
+            client = None
             try:
                 from tg_client import make_bot_client
                 client = make_bot_client()
@@ -177,46 +203,72 @@ class SearchBot:
                 self._mtproto = client
                 log.info("MTProto download client started (bot session).")
             except Exception as e:
+                # A client that connected but failed to authorise keeps its
+                # socket and <name>_bot.session handle open. Leaking one per
+                # retry eventually locks the session file for good.
                 log.error("Could not start MTProto download client: %s", e)
+                if client is not None:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
                 self._mtproto = None
             return self._mtproto
 
-    async def _download_via_mtproto(self, chat_id: int, message_id: int) -> bytes:
-        """Download a user-sent message's media as raw bytes over MTProto."""
+    async def _resolve_mtproto_peer(self, client, chat_id: int):
+        """
+        Resolve a Bot-API chat id to an MTProto input peer.
+
+        Telethon can fetch a private chat's user with access_hash=0 because we
+        are a bot, and a basic group by id. A supergroup/channel needs an access
+        hash this receive_updates=False client does not have — retry via
+        get_entity so the failure is explicit rather than a bare ValueError.
+        """
+        try:
+            return await client.get_input_entity(chat_id)
+        except Exception:
+            return await client.get_entity(chat_id)
+
+    async def _download_via_mtproto(self, chat_id: int, message_id: int, path: str) -> str:
+        """Download a user-sent message's media straight to `path` over MTProto."""
         client = await self._get_mtproto()
         if client is None:
             raise RuntimeError("MTProto client unavailable")
-        msgs = await client.get_messages(chat_id, ids=message_id)
+        peer = await self._resolve_mtproto_peer(client, chat_id)
+        msgs = await client.get_messages(peer, ids=message_id)
         msg = msgs[0] if isinstance(msgs, list) else msgs
         if msg is None or not getattr(msg, "media", None):
             raise RuntimeError("media not found for message")
-        data = await client.download_media(msg, file=bytes)
-        if not data:
+        got = await client.download_media(msg, file=path)
+        if not got or not os.path.isfile(path) or os.path.getsize(path) == 0:
             raise RuntimeError("empty download")
-        return data
+        return path
 
-    async def _fetch_media_bytes(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-                                 file_id: str, size_bytes: int = 0) -> bytes:
+    async def _fetch_media_to_path(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                                   file_id: str, path: str, size_bytes: int = 0) -> str:
         """
-        Get the bytes of a file the user just sent. Prefers MTProto (no size
-        cap); falls back to the Bot API for small files when MTProto is
-        unavailable. Raises a clear error if a large file can't be fetched.
+        Save a file the user just sent to `path`. Prefers MTProto (no size cap);
+        falls back to the Bot API for small files when MTProto is unavailable.
+        Streaming to disk keeps a 2 GB photo or backup out of the event loop's
+        memory (the old bytes API held the whole file in RAM).
         """
         chat_id = update.effective_chat.id
         message_id = update.effective_message.message_id
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         try:
-            return await self._download_via_mtproto(chat_id, message_id)
+            return await self._download_via_mtproto(chat_id, message_id, path)
         except Exception as e:
             big = size_bytes and size_bytes > 19 * 1024 * 1024
             if big:
                 raise RuntimeError(
-                    "file is larger than 20 MB and the MTProto downloader is "
-                    "unavailable — check TELEGRAM_API_ID / TELEGRAM_API_HASH / "
-                    f"BOT_TOKEN. ({e})"
+                    "file is larger than 20 MB and the MTProto downloader could "
+                    "not fetch it — check TELEGRAM_API_ID / TELEGRAM_API_HASH / "
+                    f"BOT_TOKEN (and that the bot can see this chat). ({e})"
                 )
             log.warning("MTProto download failed (%s); falling back to Bot API.", e)
             tf = await ctx.bot.get_file(file_id)
-            return bytes(await tf.download_as_bytearray())
+            await tf.download_to_drive(custom_path=path)
+            return path
 
     # ── Startup hook ──────────────────────────────────────────────────────────
 
@@ -796,12 +848,19 @@ class SearchBot:
             return
         info = models.AVAILABLE[key]
         old = models.get_active_model()
+        if self.embedder.is_busy():
+            await q.edit_message_text(
+                "⚠️ An index run is in progress — wait for it to finish "
+                "before switching models.", parse_mode="Markdown")
+            return
         await q.edit_message_text(f"⬇️ *{info['name']}* …", parse_mode="Markdown")
         try:
             r = await asyncio.to_thread(models.download_model, key)
-            self.embedder.reload()
+            reloaded = self.embedder.reload()
             from auto_scale import apply_tune
             apply_tune(self.embedder.model_size_mb)
+            if not reloaded:
+                raise RuntimeError(self.embedder.last_error or "model reload failed")
             # Record the new fingerprint only once the model is live on disk.
             models.write_model_fingerprint()
             if old and old != key and self.db.count() > 0:

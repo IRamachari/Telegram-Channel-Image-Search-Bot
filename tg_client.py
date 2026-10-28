@@ -31,7 +31,7 @@ import logging
 import os
 
 from telethon import TelegramClient
-from telethon.sessions import StringSession
+from telethon.sessions import SQLiteSession, StringSession
 
 from config import config
 
@@ -62,19 +62,18 @@ def warn_if_file_session_shared() -> None:
     """
     Warn when the on-disk session is used together with the monitor.
 
-    Every ephemeral client (indexer / estimate / cleanup) opens its own
-    SQLiteSession on the SAME ``.session`` file that the long-lived monitor
-    client holds. Two writers on one rollback-journal sqlite file can raise
-    "database is locked" mid-run, and the monitor's handle is never released.
-    A StringSession is in-memory per client and has no such contention, so it
-    is the recommended deployment for a monitor + indexer combination.
+    The monitor holds a long-lived SQLiteSession on ``<name>.session``. Every
+    ephemeral client (indexer / estimate / cleanup) now snapshots that file into
+    an in-memory StringSession instead of opening a second writer on it, so the
+    remaining contention is only with a concurrent /login. A StringSession in
+    the environment removes the file entirely and is still the recommended
+    deployment for a monitor + indexer combination.
     """
     if not has_string_session() and os.path.exists(config.SESSION_FILE):
         log.warning(
-            "Using the on-disk session %s: the monitor client and the "
-            "short-lived indexing clients share this sqlite file, which can "
-            "produce intermittent 'database is locked' errors. Set "
-            "TELETHON_STRING_SESSION to avoid the contention.",
+            "Using the on-disk session %s: the monitor holds the only writer, "
+            "but a concurrent /login can still contend for it. Set "
+            "TELETHON_STRING_SESSION to remove the file entirely.",
             config.SESSION_FILE)
 
 
@@ -113,7 +112,65 @@ def msg_link(entity, message_id: int) -> str:
 
 # ── client builders ─────────────────────────────────────────────────────────
 
-def make_user_client(receive_updates: bool = True) -> TelegramClient:
+def _ephemeral_session():
+    """
+    In-memory snapshot of the on-disk session, or ``None``.
+
+    Ephemeral clients (indexer, estimate, cleanup) used to open their own
+    SQLiteSession on the SAME ``.session`` file the long-lived monitor holds;
+    two writers on one rollback-journal sqlite file raise "database is locked"
+    mid-run. Copying the auth key into a StringSession keeps the same account
+    without a shared file. Returns ``None`` when the file cannot be read, so
+    the caller falls back to the old behaviour instead of failing.
+    """
+    if not os.path.exists(config.SESSION_FILE):
+        return None
+    base = None
+    try:
+        base = SQLiteSession(config.SESSION_FILE)
+        if not base.auth_key:
+            return None
+        session = StringSession()
+        session.set_dc(base.dc_id, base.server_address, base.port)
+        session.auth_key = base.auth_key
+        return session
+    except Exception as exc:
+        log.warning("Could not snapshot %s (%s); sharing the file session.",
+                    config.SESSION_FILE, exc)
+        return None
+    finally:
+        if base is not None:
+            try:
+                base.close()
+            except Exception:
+                pass
+
+
+async def prime_entity_cache(client) -> int:
+    """
+    Fill the client's entity cache from the dialog list.
+
+    A bare channel id (``-100…`` or the unmarked int stored in the watermark
+    state) can only be resolved when the entity — with its access_hash — is
+    already known. A StringSession persists no entities, so in a fresh process
+    ``get_entity(id)`` falls through to ``channels.GetChannelsRequest`` with
+    ``access_hash=0``, which Telegram rejects for user accounts. One
+    ``iter_dialogs()`` pass (a handful of requests) makes every chat the
+    account is in resolvable by id again. Returns the number of dialogs seen.
+    """
+    seen = 0
+    try:
+        async for _ in client.iter_dialogs(limit=None):
+            seen += 1
+    except Exception as exc:
+        log.warning("Could not prime the entity cache: %s", exc)
+    if seen:
+        log.debug("Primed entity cache with %d dialog(s)", seen)
+    return seen
+
+
+def make_user_client(receive_updates: bool = True, catch_up: bool = False,
+                     ephemeral: bool = False) -> TelegramClient:
     """
     Build (but do not connect) a Telethon client for the *user* account.
 
@@ -123,9 +180,17 @@ def make_user_client(receive_updates: bool = True) -> TelegramClient:
     `receive_updates` defaults to True because the long-running ChannelMonitor
     registers event handlers on its client. Ephemeral callers that only download
     (the indexer's per-run client) should pass False to save bandwidth.
+
+    `catch_up` makes Telethon replay the updates missed while the client was
+    disconnected; only the long-lived monitor wants that.
+
+    `ephemeral` makes a file-session client work on an in-memory copy of the
+    session so it never competes with the monitor for the sqlite file.
     """
     if has_string_session():
         session: object = StringSession(config.STRING_SESSION)
+    elif ephemeral:
+        session = _ephemeral_session() or config.SESSION_PATH
     else:
         session = config.SESSION_PATH
     return TelegramClient(
@@ -139,6 +204,7 @@ def make_user_client(receive_updates: bool = True) -> TelegramClient:
         # Indexing thousands of entities in one process.
         entity_cache_limit=20_000,
         receive_updates=receive_updates,
+        catch_up=catch_up and receive_updates,
     )
 
 

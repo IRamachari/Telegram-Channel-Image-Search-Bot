@@ -2,23 +2,43 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from dataclasses import dataclass, field
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
-from telethon.tl.types import (
-    MessageMediaPhoto, MessageMediaDocument,
-    PhotoSize, PhotoSizeProgressive, PhotoStrippedSize, PhotoCachedSize,
-)
 
 from config import config
 from database import VectorDB
 from embeddings import CLIPEmbedder
+import models
+from media import (
+    download_thumb_type, is_image, media_kind, media_size,
+    pick_photo_size, sweep_temp_dir,
+)
 
 log = logging.getLogger(__name__)
-MIN_PHOTO_SIZE = 224
+
+# A single media item must not monopolise a run: a flood wait longer than this
+# is treated as "skip this message" (the same outcome as any other download
+# failure) instead of stalling every worker for half an hour.
+_FLOOD_BUDGET_S = 1800
+
+# Channel ids with a bulk index run in flight. The monitor consults this before
+# advancing a watermark (see monitor._persist_new): jumping it ahead of the
+# indexer's gap-free prefix leaves an unretryable hole, because set_watermark()
+# only ever moves forward.
+_active_runs: set[int] = set()
+
+
+def index_in_progress(channel_id) -> bool:
+    try:
+        return int(channel_id) in _active_runs
+    except (TypeError, ValueError):
+        return False
+
 
 try:
     import cryptg
@@ -77,7 +97,10 @@ def session_info():
 
 def _make_client(receive_updates: bool = True):
     from tg_client import make_user_client
-    return make_user_client(receive_updates=receive_updates)
+    # ephemeral=True: a file-session client works on an in-memory copy of the
+    # session, so it never competes with the long-lived monitor for the sqlite
+    # file (the source of intermittent "database is locked" runs).
+    return make_user_client(receive_updates=receive_updates, ephemeral=True)
 
 
 async def check_session():
@@ -101,77 +124,16 @@ async def check_session():
         return False, f"Error: {e}"
 
 
-# MIME types worth embedding. A sticker/webp document also matches
-# "image/", but those are not photos of the kind this bot searches for and
-# indexing them pollutes the counts and the duplicate finder.
-_IMAGE_MIME = ("image/jpeg", "image/png", "image/webp", "image/bmp",
-               "image/gif", "image/tiff", "image/heic", "image/heif")
-
-
-def _is_image(msg):
-    if not msg.media:
-        return False
-    if isinstance(msg.media, MessageMediaPhoto):
-        return True
-    if isinstance(msg.media, MessageMediaDocument):
-        d = msg.media.document
-        if not d:
-            return False
-        if getattr(d, "mime_type", "") not in _IMAGE_MIME:
-            return False
-        # Exclude stickers (incl. animated/webm-styled) explicitly: they are
-        # image/* documents but are never channel photos.
-        for attr in getattr(d, "attributes", None) or []:
-            if type(attr).__name__ in ("DocumentAttributeSticker",
-                                        "DocumentAttributeAnimated"):
-                return False
-        return True
-    return False
-
-
-def _get_media_size(msg):
-    if isinstance(msg.media, MessageMediaPhoto):
-        p = msg.media.photo
-        if p and p.sizes:
-            for s in reversed(p.sizes):
-                sz = getattr(s, "size", None)
-                if sz:
-                    return sz
-                szs = getattr(s, "sizes", None)
-                if szs:
-                    return max(szs)
-        return 100000
-    if isinstance(msg.media, MessageMediaDocument):
-        d = msg.media.document
-        return d.size if d else 500000
-    return 100000
+# Media classification lives in ``media.py`` so the indexer and the monitor can
+# never disagree about what counts as an image. These aliases keep the old
+# private names working for callers that used them.
+_is_image = is_image
 
 
 def _pick_photo_size(msg):
-    if not isinstance(msg.media, MessageMediaPhoto):
-        return None
-    p = msg.media.photo
-    if not p or not p.sizes:
-        return None
-    usable = []
-    for s in p.sizes:
-        if isinstance(s, (PhotoStrippedSize, PhotoCachedSize)):
-            continue
-        if isinstance(s, PhotoSizeProgressive):
-            w, h = s.w, s.h
-        elif isinstance(s, PhotoSize):
-            w, h = s.w, s.h
-        else:
-            w, h = getattr(s, "w", 0), getattr(s, "h", 0)
-        if w > 0 and h > 0:
-            usable.append((s.type, max(w, h)))
-    if not usable:
-        return None
-    usable.sort(key=lambda x: x[1])
-    for t, sz in usable:
-        if sz >= MIN_PHOTO_SIZE:
-            return t
-    return usable[-1][0]
+    media = getattr(msg, "media", None)
+    photo = getattr(media, "photo", None)
+    return pick_photo_size(photo) if photo else None
 
 
 def _msg_link(entity, mid):
@@ -191,16 +153,54 @@ def _is_restricted(entity):
     return getattr(entity, "noforwards", False)
 
 
+# ``t.me/<user>``, ``t.me/<user>/<msg>``, ``t.me/c/<id>``, ``t.me/c/<id>/<msg>``,
+# optionally with a scheme/www prefix and a query/fragment tail.
+_TME_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(?P<rest>[^\s?#]+)", re.I)
+
+
+async def _resolve_numeric(client, value):
+    """Resolve an id, priming the entity cache if the id is not known yet."""
+    try:
+        return await client.get_entity(value)
+    except (TypeError, ValueError):
+        # A bare id is only resolvable when its access_hash is cached. A
+        # StringSession persists no entities, so in a fresh process this fails
+        # until one dialog-list pass has filled the cache.
+        from tg_client import prime_entity_cache
+        await prime_entity_cache(client)
+        return await client.get_entity(value)
+
+
 async def resolve_channel(client, ch):
+    """
+    Turn user input into a channel entity.
+
+    Accepts ``@username``, a bare/marked id, and every ``t.me`` form —
+    including message deep links (``t.me/c/<id>/<msg>`` and
+    ``t.me/<username>/<msg>``), whose trailing message id is not part of the
+    entity. ``t.me/+invite`` / ``t.me/joinchat/...`` are passed through to
+    Telethon, which raises when the account is not a member yet.
+    """
     if isinstance(ch, int):
-        return await client.get_entity(ch)
+        return await _resolve_numeric(client, ch)
     text = str(ch).strip()
+    if not text:
+        raise ValueError("empty channel")
+    match = _TME_RE.search(text)
+    if match:
+        rest = match.group("rest").strip("/")
+        if rest.startswith(("+", "joinchat/")):
+            return await client.get_entity(text)
+        parts = [p for p in rest.split("/") if p]
+        if len(parts) >= 2 and parts[0].lower() == "c" and parts[1].isdigit():
+            return await _resolve_numeric(client, int(parts[1]))
+        if parts:
+            return await _resolve_numeric(client, parts[0].lstrip("@"))
+        raise ValueError(f"not a channel link: {text}")
     if text.lstrip("-").isdigit():
-        return await client.get_entity(int(text))
-    if "t.me/" in text:
-        slug = text.rstrip("/").split("/")[-1]
-        return await client.get_entity(text) if slug.startswith("+") else await client.get_entity(slug)
-    return await client.get_entity(text)
+        return await _resolve_numeric(client, int(text))
+    return await _resolve_numeric(client, text.lstrip("@"))
 
 
 @dataclass
@@ -631,24 +631,30 @@ class ChannelIndexer:
                          stats.downloaded, stats.embedded, stats.errors,
                          cur_c_i[0], limiter.active)
 
-        p = asyncio.create_task(producer())
-        c = asyncio.create_task(consumer())
-        h = asyncio.create_task(hb())
-        try:
-            # No return_exceptions: a producer/consumer bug must fail the run.
-            await asyncio.gather(p, c)
-        finally:
-            # Cancel, then WAIT (bounded) so unwinding tasks finish their own
-            # finally blocks before this coroutine is torn down. Awaiting
-            # unconditionally inside a cancelled frame is legal only because
-            # _on_shutdown cancels once; asyncio.wait cannot raise.
-            for t in (p, c, h):
-                t.cancel()
-            await asyncio.wait({p, c, h}, timeout=10)
+        with self.embedder.indexing():
+            p = asyncio.create_task(producer())
+            c = asyncio.create_task(consumer())
+            h = asyncio.create_task(hb())
+            try:
+                # No return_exceptions: a producer/consumer bug must fail the run.
+                await asyncio.gather(p, c)
+            finally:
+                # Cancel, then WAIT (bounded) so unwinding tasks finish their own
+                # finally blocks before this coroutine is torn down. Awaiting
+                # unconditionally inside a cancelled frame is legal only because
+                # _on_shutdown cancels once; asyncio.wait cannot raise.
+                for t in (p, c, h):
+                    t.cancel()
+                await asyncio.wait({p, c, h}, timeout=10)
 
         log.info("DONE emb=%d skip=%d err=%d flood=%d %.1fMB %.1f/s %ds DB=%d",
                  stats.embedded, stats.skipped, stats.errors, stats.flood_waits,
                  stats.mb_downloaded, stats.speed, stats.elapsed, self.db.count())
+        if stats.embedded > 0:
+            try:
+                models.mark_vectors_indexed()
+            except Exception as exc:
+                log.warning("Could not record model fingerprint: %s", exc)
         return stats.embedded
 
     def _flush(self, ids, paths, metas):

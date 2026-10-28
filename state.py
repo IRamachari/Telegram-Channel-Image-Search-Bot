@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 
 from config import config
@@ -14,6 +15,10 @@ log = logging.getLogger(__name__)
 # Kept INSIDE the database directory so it is included in /export backups and
 # replaced by /import, the same as the index watermarks.
 _STATE_FILE = Path(config.CHROMA_DIR) / "bot_state.json"
+# Serialises the read-modify-write in put(): two admins pinning status messages
+# in different chats at the same time used to load the same dict, and the
+# second write silently dropped the first entry.
+_LOCK = threading.Lock()
 
 
 def _load() -> dict:
@@ -44,16 +49,25 @@ def _save(state: dict) -> None:
 
 
 def get(key: str, default=None):
-    return _load().get(key, default)
+    with _LOCK:
+        return _load().get(key, default)
 
 
 def put(key: str, value) -> None:
-    s = _load()
-    s[key] = value
-    _save(s)
+    """
+    Persist one key.
+
+    The entire load-modify-save runs under a process-wide lock; concurrent
+    writers previously clobbered each other's keys.
+    """
+    with _LOCK:
+        s = _load()
+        s[key] = value
+        _save(s)
 
 
 def delete(key: str) -> None:
-    s = _load()
-    s.pop(key, None)
-    _save(s)
+    with _LOCK:
+        s = _load()
+        s.pop(key, None)
+        _save(s)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import logging
 import threading
+from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
 
@@ -25,6 +26,11 @@ _MAX_SIDE = 8192
 # Image.draft() or reducing_gap) changes the decoded pixels, and therefore the
 # embeddings. Bumping this invalidates every existing vector, so it is folded
 # into the model fingerprint to force the "re-index required" warning.
+#
+# Deliberately NOT applied here: ImageOps.exif_transpose(). Honouring the EXIF
+# Orientation tag would change the pixels of every rotated photo, i.e. it is a
+# real pipeline change that must ship together with PREP_VERSION = 3 and a
+# forced full re-index — not as a silent drop-in at version 2.
 PREP_VERSION = 2
 
 # Fallback when the model declares nothing and the session shape is dynamic.
@@ -44,11 +50,18 @@ class CLIPEmbedder:
         self.input_size = _DEFAULT_INPUT
         self.crop_mode = "center"
         self._lock = threading.Lock()
+        # Inference / index-run counters. reload() refuses to swap the session
+        # while either is non-zero: swapping mid-batch would mix two feature
+        # spaces into one index with no error at all.
+        self._active_runs = 0
+        self._index_depth = 0
+        # Why the last reload() was refused or failed, for the /model reply.
+        self.last_error = None
         self._try_load()
 
-    def _apply_model_settings(self) -> None:
+    def _resolve_settings(self, session) -> tuple[str, int]:
         """
-        Decide the input resolution and cropping from the active model.
+        Decide the input resolution and cropping for `session`.
 
         The resolution is read from the ONNX input shape when it is a fixed
         integer, so any model (224px, 336px, other) works without a code
@@ -61,12 +74,12 @@ class CLIPEmbedder:
             settings = get_active_settings()
         except Exception:
             pass
-        self.crop_mode = str(settings.get("crop", "center"))
+        crop = str(settings.get("crop", "center"))
         declared = int(settings.get("input", _DEFAULT_INPUT) or _DEFAULT_INPUT)
 
         detected = None
         try:
-            shape = self.session.get_inputs()[0].shape
+            shape = session.get_inputs()[0].shape
             # Typical CLIP shape: [batch, channels, height, width]
             dims = [d for d in (shape or [])][2:]
             fixed = [int(d) for d in dims if isinstance(d, int) and d > 0]
@@ -74,78 +87,116 @@ class CLIPEmbedder:
                 detected = fixed[0]
         except Exception:
             detected = None
-        if detected:
-            self.input_size = detected
-        else:
-            self.input_size = declared
-        log.info("CLIP preprocessing: %dpx input, crop=%s",
-                 self.input_size, self.crop_mode)
+        size = detected or declared
+        log.info("CLIP preprocessing: %dpx input, crop=%s", size, crop)
+        return crop, size
 
-    def _try_load(self) -> None:
-        if not ONNX_PATH.exists():
-            log.warning("No model file at %s", ONNX_PATH)
-            return
-        self.model_size_mb = ONNX_PATH.stat().st_size / 1024 / 1024
+    @staticmethod
+    def _options(intra: int, inter: int):
+        opts = ort.SessionOptions()
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        opts.intra_op_num_threads = intra
+        opts.inter_op_num_threads = inter
+        # Documented benchmark winner for CPU inference (onnxruntime docs,
+        # "Threading control"): reduces spin-wait overhead between ops.
         try:
-            from auto_scale import apply_tune, get_threads
-            apply_tune(self.model_size_mb)
-            intra, inter = get_threads()
+            opts.add_session_config_entry(
+                "session.intra_op.spin_duration_us", "1000")
+            opts.add_session_config_entry(
+                "session.intra_op.spin_backoff_max", "8")
         except Exception:
-            intra, inter = 4, 2
-        # Record BEFORE building: /tune compares this even when the build
-        # below fails, so it can offer a retry once the file is fixed.
-        self._thread_tune = (intra, inter)
-        try:
-            log.info("Loading CLIP ONNX (%.0f MB) threads=%d/%d …",
-                     self.model_size_mb, intra, inter)
-            opts = ort.SessionOptions()
-            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            opts.intra_op_num_threads = intra
-            opts.inter_op_num_threads = inter
-            # Documented benchmark winner for CPU inference (onnxruntime docs,
-            # "Threading control"): reduces spin-wait overhead between ops.
+            pass
+        return opts
+
+    def _try_load(self) -> bool:
+        """Load the model from disk. Kept for callers that expect no refusal."""
+        return self.reload(force=True)
+
+    def reload(self, force: bool = False) -> bool:
+        """
+        Swap in a new session, keeping the old one when the build fails.
+
+        The new session is built into locals and committed in a single step, so
+        a corrupt or unreadable model leaves the previous session — and its
+        preprocessing settings — fully intact instead of leaving the bot with
+        no model until the next restart.
+
+        Refuses while an inference batch or an index run is in progress (see
+        is_busy()/indexing()) unless `force` is set: a swap between batches
+        would put two incompatible feature spaces in the same index. Returns
+        True when a usable session is live afterwards; `last_error` says why
+        when it is False.
+        """
+        with self._lock:
+            if not force and self.is_busy():
+                self.last_error = ("busy: an index run or inference batch is "
+                                   "in progress")
+                log.warning("Model reload refused — %s", self.last_error)
+                return False
+            if not ONNX_PATH.exists():
+                self.last_error = f"no model file at {ONNX_PATH}"
+                log.warning("No model file at %s", ONNX_PATH)
+                return self.is_ready()
+            size_mb = ONNX_PATH.stat().st_size / 1024 / 1024
             try:
-                opts.add_session_config_entry(
-                    "session.intra_op.spin_duration_us", "1000")
-                opts.add_session_config_entry(
-                    "session.intra_op.spin_backoff_max", "8")
+                from auto_scale import apply_tune, get_threads
+                apply_tune(size_mb)
+                intra, inter = get_threads()
             except Exception:
-                pass
-            self.session = ort.InferenceSession(
-                str(ONNX_PATH), opts, providers=["CPUExecutionProvider"],
-            )
-            self.input_name = self.session.get_inputs()[0].name
-            # Resolve resolution/cropping once the session exists.
-            self._apply_model_settings()
+                intra, inter = 4, 1
+            # Record BEFORE building: /tune compares this even when the build
+            # below fails, so it can offer a retry once the file is fixed.
+            self._thread_tune = (intra, inter)
+            try:
+                log.info("Loading CLIP ONNX (%.0f MB) threads=%d/%d …",
+                         size_mb, intra, inter)
+                # onnxruntime session construction is not thread-safe, which is
+                # the other reason this whole block holds the lock.
+                session = ort.InferenceSession(
+                    str(ONNX_PATH), self._options(intra, inter),
+                    providers=["CPUExecutionProvider"],
+                )
+                name = session.get_inputs()[0].name
+                crop, input_size = self._resolve_settings(session)
+            except Exception as exc:
+                self.last_error = str(exc)
+                log.error("Failed to load model (previous session kept): %s",
+                          exc)
+                return self.is_ready()
+            # Commit — nothing above this line mutated the live session.
+            self.session, self.input_name = session, name
+            self.crop_mode, self.input_size = crop, input_size
+            self.model_size_mb = size_mb
+            self.last_error = None
             log.info("CLIP ready. Input: %s (%dpx, %s crop)",
-                     self.input_name, self.input_size, self.crop_mode)
-        except Exception as exc:
-            log.error("Failed to load model: %s", exc)
-            self.session = None
+                     name, input_size, crop)
+            return True
 
     def is_ready(self) -> bool:
         return self.session is not None
 
-    def reload(self) -> bool:
-        """
-        Swap in a new session.
+    def is_busy(self) -> bool:
+        """True while an inference batch or an index run is in flight."""
+        return bool(self._active_runs or self._index_depth)
 
-        The lock is held for the whole build so _run() can never observe the
-        intermediate session=None state (which used to make an entire batch
-        silently produce no vectors). onnxruntime session *construction* is not
-        thread-safe either, so serialising it is required regardless.
+    @contextmanager
+    def indexing(self):
+        """
+        Mark the whole span of an index run so /model cannot swap the model
+        between two batches. indexer.py should wrap its run in:
+
+            with embedder.indexing():
+                ...download/embed batches...
+
+        reload() then refuses (returning False) until the run finishes.
         """
         with self._lock:
-            old_session, old_name = self.session, self.input_name
-            self.session = None
-            self.input_name = None
-            try:
-                self._try_load()
-            except Exception:
-                self.session = old_session
-                self.input_name = old_name
-                raise
-        return self.is_ready()
+            self._index_depth += 1
+        try:
+            yield self
+        finally:
+            with self._lock:
+                self._index_depth -= 1
 
     def get_dim(self) -> int:
         if not self.session:
@@ -178,6 +229,9 @@ class CLIPEmbedder:
         img.draft("RGB", (target, target))
 
         # 3. `img.size` may have changed after draft() — re-read it.
+        #    NOTE: EXIF Orientation is deliberately ignored (see PREP_VERSION);
+        #    honouring it would change every rotated photo's embedding and so
+        #    requires a pipeline-version bump plus a full re-index.
         img = img.convert("RGB")
         if self.crop_mode == "stretch":
             img = img.resize((target, target), Image.BICUBIC, reducing_gap=2.0)
@@ -212,15 +266,22 @@ class CLIPEmbedder:
         `images` (a list of raw PIL images) is an alternative to `batch` for
         convenience. onnxruntime's Run is thread-safe for concurrent use, but
         NOT for being swapped mid-call, so the session reference is copied
-        once and an in-flight run keeps its own object alive.
+        once and an in-flight run keeps its own object alive. The run is also
+        counted, so reload() refuses to swap the session under it.
         """
         with self._lock:
             session, name = self.session, self.input_name
+            if session is not None and name is not None:
+                self._active_runs += 1
         if session is None or name is None:
             raise RuntimeError("Model not loaded. Use /model to download one.")
-        if images is not None:
-            batch = np.stack([self._preprocess(im) for im in images]).astype(np.float32)
-        outs = session.run(None, {name: batch})
+        try:
+            if images is not None:
+                batch = np.stack([self._preprocess(im) for im in images]).astype(np.float32)
+            outs = session.run(None, {name: batch})
+        finally:
+            with self._lock:
+                self._active_runs -= 1
         emb = outs[-1] if len(outs) > 1 else outs[0]
         if len(emb.shape) == 3:
             emb = emb[:, 0, :]
