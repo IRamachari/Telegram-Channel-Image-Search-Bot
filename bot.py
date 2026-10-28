@@ -1718,13 +1718,6 @@ class SearchBot:
         app.add_handler(CommandHandler("checkupdates",  self.cmd_checkupdates))  # NEW
         app.add_handler(CommandHandler("setpinned",     self.cmd_setpinned))     # NEW
 
-        # PTB's ConversationHandler dispatches timeouts to the handler registered
-        # under ConversationHandler.TIMEOUT (== -2). Registering under any other
-        # constant makes the handler unreachable dead code.
-        timeout_states = {
-            ConversationHandler.TIMEOUT: [
-                MessageHandler(filters.ALL, self.on_conv_timeout)]
-        }
 
         app.add_handler(ConversationHandler(
             entry_points=[CommandHandler("login", self.login_start)],
@@ -1732,10 +1725,8 @@ class SearchBot:
                 LOGIN_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.login_phone)],
                 LOGIN_CODE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, self.login_code)],
                 LOGIN_2FA:   [MessageHandler(filters.TEXT & ~filters.COMMAND, self.login_2fa)],
-                **timeout_states,
             },
-            fallbacks=[CommandHandler("cancel", self.cmd_cancel)],
-            conversation_timeout=300))
+            fallbacks=[CommandHandler("cancel", self.cmd_cancel)]))
         app.add_handler(ConversationHandler(
             entry_points=[CommandHandler("import", self.import_start)],
             states={
@@ -1744,19 +1735,15 @@ class SearchBot:
                     MessageHandler(filters.PHOTO, self.import_file),
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self.import_file),
                 ],
-                **timeout_states,
             },
-            fallbacks=[CommandHandler("cancel", self.cmd_cancel)],
-            conversation_timeout=600))
+            fallbacks=[CommandHandler("cancel", self.cmd_cancel)]))
         app.add_handler(ConversationHandler(
             entry_points=[CommandHandler("index", self.index_start)],
             states={
                 INDEX_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.index_channel)],
                 INDEX_LIMIT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, self.index_limit)],
-                **timeout_states,
             },
-            fallbacks=[CommandHandler("cancel", self.cmd_cancel)],
-            conversation_timeout=300))
+            fallbacks=[CommandHandler("cancel", self.cmd_cancel)]))
 
         app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CallbackQueryHandler(self.model_cb,   pattern=r"^dl_"))
