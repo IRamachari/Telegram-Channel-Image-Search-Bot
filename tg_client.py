@@ -44,9 +44,30 @@ _MARKED_PREFIX = "-100"
 
 # ── session discovery ───────────────────────────────────────────────────────
 
+def _string_session_valid(s: str) -> bool:
+    """True if ``s`` is a non-empty, well-formed Telethon StringSession.
+
+    A malformed value (truncated, wrong format, bad base64 padding, Pyrogram
+    string, ...) must never reach ``StringSession()``: Telethon raises
+    ``binascii.Error`` / ``ValueError`` at construction time, which propagates
+    up through every caller (monitor start, /index, startup sync) as an
+    unhandled exception. Treating an invalid string as "no session" lets the
+    bot fall back to the on-disk file session or prompt for /login instead of
+    crashing the whole handler.
+    """
+    if not s:
+        return False
+    try:
+        StringSession(s)
+        return True
+    except Exception:
+        log.warning("TELETHON_STRING_SESSION is set but malformed; ignoring it.")
+        return False
+
+
 def has_string_session() -> bool:
-    """True if a Telethon StringSession was supplied via the environment."""
-    return bool(config.STRING_SESSION)
+    """True if a valid Telethon StringSession was supplied via the env."""
+    return _string_session_valid(config.STRING_SESSION)
 
 
 def user_session_available() -> bool:
@@ -217,9 +238,11 @@ def make_bot_client() -> TelegramClient:
     bot updates, which would otherwise conflict with python-telegram-bot's
     long-polling ("terminated by other getUpdates request").
     """
-    if config.BOT_STRING_SESSION:
+    if config.BOT_STRING_SESSION and _string_session_valid(config.BOT_STRING_SESSION):
         session: object = StringSession(config.BOT_STRING_SESSION)
     else:
+        if config.BOT_STRING_SESSION:
+            log.warning("BOT_STRING_SESSION is set but malformed; using file session.")
         session = config.BOT_SESSION_PATH
     return TelegramClient(
         session, config.API_ID, config.API_HASH, receive_updates=False,
