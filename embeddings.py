@@ -1,7 +1,6 @@
 from __future__ import annotations
 import logging
 import threading
-import time
 from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path

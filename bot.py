@@ -4,6 +4,7 @@ import io as io_module
 import logging
 import os
 import re
+import tempfile
 import time
 from datetime import datetime
 
@@ -15,7 +16,7 @@ from telegram.ext import (
     ConversationHandler, CallbackQueryHandler,
     ContextTypes, filters,
 )
-from telegram.error import RetryAfter, TimedOut
+from telegram.error import RetryAfter
 
 from config import config
 from database import VectorDB
@@ -45,6 +46,46 @@ _IMPORT_MAX_BYTES = 16 * 1024 ** 3
 # db_manager still accepts the archive as bytes, so the final hand-off must fit
 # in memory. Refuse anything larger with a clear message instead of OOMing.
 _IMPORT_MAX_HANDOFF_BYTES = 2 * 1024 ** 3
+
+
+def _stage_import_part(data: bytes, parts: list) -> str:
+    """
+    Write one /import backup part to TEMP_DIR and return its path.
+
+    Staging on disk keeps a multi-GB multi-part upload out of RAM; the caps
+    (see _IMPORT_MAX_* above) stop a runaway or wrong-file upload from filling
+    the disk before the operator types `done`.
+    """
+    if len(parts) >= _IMPORT_MAX_PARTS:
+        raise RuntimeError(
+            f"Too many parts (limit {_IMPORT_MAX_PARTS}). "
+            "Start /import again and send the correct files.")
+    staged = sum(os.path.getsize(p) for p, _ in parts)
+    if staged + len(data) > _IMPORT_MAX_BYTES:
+        raise RuntimeError(
+            "Staged parts exceed the 16 GB limit. "
+            "Start /import again and send the correct files.")
+    os.makedirs(config.TEMP_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="import_part_", dir=config.TEMP_DIR)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return tmp
+
+
+def _discard_import_parts(parts) -> None:
+    """Delete staged /import part files (best effort — never raises)."""
+    for item in parts or []:
+        try:
+            os.unlink(item[0])
+        except (OSError, IndexError, TypeError):
+            pass
 
 
 def _looks_like_backup_part(name: str) -> bool:
@@ -284,7 +325,6 @@ class SearchBot:
         files when MTProto is unavailable. Raises a clear error if a large file
         can't be fetched.
         """
-        import tempfile
         fd, tmp = tempfile.mkstemp(prefix="media_", dir=config.TEMP_DIR)
         os.close(fd)
         try:
@@ -733,7 +773,7 @@ class SearchBot:
                 await cl.disconnect()
             except Exception:
                 pass
-        self._import_parts.pop(update.effective_user.id, None)
+        _discard_import_parts(self._import_parts.pop(update.effective_user.id, None))
         await update.message.reply_text("Cancelled.", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
 
@@ -756,7 +796,8 @@ class SearchBot:
             if update is not None:
                 eff = getattr(update, "effective_user", None)
                 if eff is not None:
-                    self._import_parts.pop(eff.id, None)
+                    _discard_import_parts(
+                        self._import_parts.pop(eff.id, None))
         except Exception as e:
             log.debug("Conversation timeout cleanup: %s", e)
         return ConversationHandler.END
@@ -901,7 +942,8 @@ class SearchBot:
             r = await asyncio.to_thread(models.download_model, key)
             if self.embedder.is_busy():
                 raise RuntimeError("an index run started during download; model not switched")
-            reloaded = self.embedder.reload()
+            # ONNX session construction takes seconds — never on the event loop.
+            reloaded = await asyncio.to_thread(self.embedder.reload)
             from auto_scale import apply_tune
             apply_tune(self.embedder.model_size_mb)
             if not reloaded:
@@ -976,6 +1018,8 @@ class SearchBot:
             return ConversationHandler.END
         cur = self.db.count()
         w = f"\n⚠️ Replaces *{cur:,}* current vectors.\n" if cur > 0 else "\n"
+        # A previously abandoned /import may have left parts staged on disk.
+        _discard_import_parts(self._import_parts.get(update.effective_user.id))
         self._import_parts[update.effective_user.id] = []
         await update.message.reply_text(
             f"📥 *Import Database*\n{w}"
@@ -1015,10 +1059,11 @@ class SearchBot:
             log.error("Reopen of vector store failed, keeping old handle: %s", e)
             return
         # Release the previous instance's background writer threads —
-        # otherwise each /import leaks them.
+        # otherwise each /import leaks them. close(wait=True) joins them (up
+        # to its timeout), so it must not run on the event loop.
         if old_db is not None and old_db is not self.db:
             try:
-                old_db.close(wait=True, timeout=10.0)
+                await asyncio.to_thread(old_db.close, True, 10.0)
             except Exception:
                 pass
         self.searcher = ImageSearcher(self.db, self.embedder)
@@ -1042,11 +1087,25 @@ class SearchBot:
                 msg = await update.message.reply_text(f"📥 Assembling {len(parts)} parts …")
                 try:
                     from db_manager import import_db_parts
+                    # The final hand-off must fit in memory (db_manager accepts
+                    # the archive as bytes): refuse anything larger with a
+                    # clear message instead of OOMing the process.
+                    staged_bytes = sum(os.path.getsize(p) for p, _ in parts)
+                    if staged_bytes > _IMPORT_MAX_HANDOFF_BYTES:
+                        raise RuntimeError(
+                            f"Backup is {staged_bytes / 1024 ** 3:.1f} GB — over "
+                            f"the {_IMPORT_MAX_HANDOFF_BYTES // 1024 ** 3} GB "
+                            "in-memory limit. Import it on a machine with more "
+                            "RAM.")
+                    items = []
+                    for p, orig in parts:
+                        with open(p, "rb") as fh:
+                            items.append((fh.read(), orig))
                     # Hold the write gate for the WHOLE import: import_db moves
                     # chroma_db aside and rmtrees it, so a monitor write landing
                     # in that window goes to a deleted directory and is lost.
                     async with self._write_gate:
-                        r = await asyncio.to_thread(import_db_parts, list(parts))
+                        r = await asyncio.to_thread(import_db_parts, items)
                         await self._rebind_db()
                     extra = ""
                     adv = (r or {}).get("watermarks_advanced")
@@ -1066,10 +1125,10 @@ class SearchBot:
                     await self._rebind_db()
                     await _edit(msg, f"❌ `{e}`", parse_mode="Markdown")
                 finally:
-                    # ALWAYS release the staged bytes: if _rebind_db raised above,
-                    # the early return left a multi-GB backup pinned in RAM and
-                    # the conversation stuck in IMPORT_WAITING forever.
-                    self._import_parts.pop(uid, None)
+                    # ALWAYS release the staged part files: if _rebind_db raised
+                    # above, the early return left a multi-GB backup pinned on
+                    # disk and the conversation stuck in IMPORT_WAITING forever.
+                    _discard_import_parts(self._import_parts.pop(uid, None))
                 return ConversationHandler.END
             else:
                 await update.message.reply_text(
@@ -1090,6 +1149,13 @@ class SearchBot:
             return IMPORT_WAITING
         name = doc.file_name or ""
         sz = (doc.file_size or 0) / 1024 / 1024
+        # A single .zip must fit in memory at hand-off (import_db takes bytes).
+        if (doc.file_size or 0) > _IMPORT_MAX_HANDOFF_BYTES:
+            await update.message.reply_text(
+                f"❌ Backup is {sz:.1f} GB — over the "
+                f"{_IMPORT_MAX_HANDOFF_BYTES // 1024 ** 3} GB in-memory limit.",
+                parse_mode="Markdown")
+            return IMPORT_WAITING
         msg = await update.message.reply_text(f"📥 Downloading `{name}` ({sz:.1f} MB) …",
                                                parse_mode="Markdown")
         try:
@@ -1099,6 +1165,13 @@ class SearchBot:
             await _edit(msg, f"❌ Download failed: `{e}`", parse_mode="Markdown")
             return IMPORT_WAITING
         if name.endswith(".zip"):
+            if len(data) > _IMPORT_MAX_HANDOFF_BYTES:
+                # file_size can be missing/0 — enforce the cap on the real bytes.
+                await _edit(msg,
+                    f"❌ Backup is {len(data) / 1024 ** 3:.1f} GB — over the "
+                    f"{_IMPORT_MAX_HANDOFF_BYTES // 1024 ** 3} GB in-memory limit.",
+                    parse_mode="Markdown")
+                return IMPORT_WAITING
             await _edit(msg, "📥 Importing …", parse_mode="Markdown")
             try:
                 from db_manager import import_db
@@ -1122,14 +1195,22 @@ class SearchBot:
                 await self._rebind_db()
                 await _edit(msg, f"❌ `{e}`", parse_mode="Markdown")
             finally:
-                self._import_parts.pop(uid, None)
+                _discard_import_parts(self._import_parts.pop(uid, None))
             return ConversationHandler.END
-        # Multi-part backups: keep the filename with the bytes so the part
-        # ordering/geometry can be validated before anything is written.
+        # Multi-part backups: stage the bytes on DISK with the filename, so a
+        # multi-GB upload never sits in RAM, and the part ordering/geometry
+        # can be validated before anything is written.
         if _looks_like_backup_part(name):
-            self._import_parts.setdefault(uid, []).append((data, name))
+            parts = self._import_parts.setdefault(uid, [])
+            try:
+                staged = _stage_import_part(data, parts)
+            except RuntimeError as e:
+                await _edit(msg, f"❌ {e}", parse_mode="Markdown")
+                return IMPORT_WAITING
+            parts.append((staged, name))
+            staged_mb = sum(os.path.getsize(p) for p, _ in parts) / 1024 / 1024
             await _edit(msg,
-                f"📦 Part received ({sz:.1f} MB)\n"
+                f"📦 Part received ({sz:.1f} MB — {staged_mb:.1f} MB staged)\n"
                 f"Send next part or type `done` to import.",
                 parse_mode="Markdown")
             return IMPORT_WAITING
@@ -1637,13 +1718,14 @@ class SearchBot:
                 count = await ChannelIndexer(
                     self.db, self.embedder, db_lock=self._db_lock,
                 ).index_channel(ch, limit=limit, progress_callback=prog)
-                # Re-read through self.db after the run so a rebind during the
-                # run is still reflected in the summary.
-                ss = await asyncio.to_thread(system_info.get_system_stats)
-                await _edit(msg,
-                    f"✅ *Done!* 📸*{count}* 📊*{self.db.count():,}* "
-                    f"💾*{ss['chroma_mb']:.1f}MB* 🧠*{ss['ram_used_mb']:.0f}MB*",
-                    parse_mode="Markdown")
+            # Re-read through self.db after the run so a rebind during the
+            # run is still reflected in the summary — outside the gate, so
+            # /import and /cleanup are unblocked as soon as the run ends.
+            ss = await asyncio.to_thread(system_info.get_system_stats)
+            await _edit(msg,
+                f"✅ *Done!* 📸*{count}* 📊*{self.db.count():,}* "
+                f"💾*{ss['chroma_mb']:.1f}MB* 🧠*{ss['ram_used_mb']:.0f}MB*",
+                parse_mode="Markdown")
             if count > 0 and self._app:
                 await self._update_pinned_message(self._app.bot)
             if self._monitor is not None and getattr(self._monitor, "running", False):
@@ -1674,7 +1756,14 @@ class SearchBot:
 
     async def on_doc(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         doc = update.message.document
-        if not (doc.mime_type or "").startswith("image/"):
+        # Some uploads carry no mime_type at all — fall back to the filename
+        # extension so a photo sent as a file is still searchable.
+        name = (doc.file_name or "").lower()
+        is_image_doc = ((doc.mime_type or "").startswith("image/") or
+                        name.endswith((".jpg", ".jpeg", ".png", ".webp",
+                                       ".bmp", ".gif", ".tiff", ".tif",
+                                       ".heic", ".heif")))
+        if not is_image_doc:
             return
         if not self.embedder.is_ready():
             return await update.message.reply_text("❌ /model first")
@@ -1725,8 +1814,14 @@ class SearchBot:
                 LOGIN_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.login_phone)],
                 LOGIN_CODE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, self.login_code)],
                 LOGIN_2FA:   [MessageHandler(filters.TEXT & ~filters.COMMAND, self.login_2fa)],
+                # A timed-out login must release the connected Telethon client
+                # (and its sqlite session handle) — see on_conv_timeout.
+                ConversationHandler.TIMEOUT: [
+                    MessageHandler(filters.ALL, self.on_conv_timeout)],
             },
-            fallbacks=[CommandHandler("cancel", self.cmd_cancel)]))
+            fallbacks=[CommandHandler("cancel", self.cmd_cancel)],
+            conversation_timeout=300,
+        ))
         app.add_handler(ConversationHandler(
             entry_points=[CommandHandler("import", self.import_start)],
             states={
@@ -1735,15 +1830,24 @@ class SearchBot:
                     MessageHandler(filters.PHOTO, self.import_file),
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self.import_file),
                 ],
+                # A timed-out import must release the staged part files.
+                ConversationHandler.TIMEOUT: [
+                    MessageHandler(filters.ALL, self.on_conv_timeout)],
             },
-            fallbacks=[CommandHandler("cancel", self.cmd_cancel)]))
+            fallbacks=[CommandHandler("cancel", self.cmd_cancel)],
+            conversation_timeout=600,
+        ))
         app.add_handler(ConversationHandler(
             entry_points=[CommandHandler("index", self.index_start)],
             states={
                 INDEX_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.index_channel)],
                 INDEX_LIMIT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, self.index_limit)],
+                ConversationHandler.TIMEOUT: [
+                    MessageHandler(filters.ALL, self.on_conv_timeout)],
             },
-            fallbacks=[CommandHandler("cancel", self.cmd_cancel)]))
+            fallbacks=[CommandHandler("cancel", self.cmd_cancel)],
+            conversation_timeout=300,
+        ))
 
         app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CallbackQueryHandler(self.model_cb,   pattern=r"^dl_"))

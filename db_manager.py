@@ -275,10 +275,6 @@ def import_db(zip_bytes: bytes) -> dict:
                 raise RuntimeError("Imported backup contains no vectors.")
             # integrity check
             try:
-                con = _connect_import = None
-            except Exception:
-                pass
-            try:
                 _con = __import__("sqlite3").connect(str(Path(config.CHROMA_DIR) / "vectors.sqlite3"))
                 try:
                     _con.execute("PRAGMA busy_timeout=30000;")

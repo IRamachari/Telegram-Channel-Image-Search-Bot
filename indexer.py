@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import importlib
 import logging
 import os
 import re
@@ -7,16 +8,12 @@ import time
 from pathlib import Path
 from dataclasses import dataclass, field
 
-from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 
 from config import config
-from database import VectorDB
-from embeddings import CLIPEmbedder
 import models
 from media import (
-    download_thumb_type, is_image, media_kind, media_size,
-    pick_photo_size, sweep_temp_dir,
+    download_thumb_type, is_image, media_size, sweep_temp_dir,
 )
 
 log = logging.getLogger(__name__)
@@ -40,17 +37,23 @@ def index_in_progress(channel_id) -> bool:
         return False
 
 
-try:
-    import cryptg
-    HAS_CRYPTG = True
-except ImportError:
-    HAS_CRYPTG = False
+def _module_available(name: str) -> bool:
+    """
+    True when `name` is importable.
 
-try:
-    from fast_telethon import download_file as fast_download
-    HAS_FAST_DL = True
-except ImportError:
-    HAS_FAST_DL = False
+    These really are imports, not find_spec probes: importing cryptg is what
+    registers its fast MTProto crypto with Telethon, so the check and the
+    speedup are one and the same.
+    """
+    try:
+        importlib.import_module(name)
+        return True
+    except ImportError:
+        return False
+
+
+HAS_CRYPTG = _module_available("cryptg")
+HAS_FAST_DL = _module_available("fast_telethon")
 
 
 def _get_parallel():
@@ -128,12 +131,6 @@ async def check_session():
 # never disagree about what counts as an image. These aliases keep the old
 # private names working for callers that used them.
 _is_image = is_image
-
-
-def _pick_photo_size(msg):
-    media = getattr(msg, "media", None)
-    photo = getattr(media, "photo", None)
-    return pick_photo_size(photo) if photo else None
 
 
 def _msg_link(entity, mid):
@@ -273,7 +270,6 @@ class _Limiter:
         # and the acquire raised CancelledError with the slot never returned —
         # permanently leaking a permit and deadlocking every later acquire.
         self._active -= 1
-        n = self._active
         async with self._cond:
             self._cond.notify_all()
 
@@ -305,7 +301,7 @@ class ChannelIndexer:
                 async for m in c.iter_messages(e, limit=sample):
                     if _is_image(m):
                         photos += 1
-                        tsize += _get_media_size(m)
+                        tsize += media_size(m)
             ratio = photos / sample if sample > 0 else 0
             est = int(total * ratio)
             avg = tsize / photos if photos > 0 else 100000
@@ -353,7 +349,21 @@ class ChannelIndexer:
 
     async def _fast_index(self, client, entity, limit, progress_cb, concurrency):
         ch_id = entity.id
+        # Registered for the whole run so the monitor never advances this
+        # channel's watermark past a bulk index in flight (see
+        # monitor._persist_new). The finally guarantees the registration is
+        # released even when the run raises — a leaked entry used to pin
+        # index_in_progress() on the channel until the process restarted.
         _active_runs.add(int(ch_id))
+        try:
+            return await self._fast_index_run(
+                client, entity, limit, progress_cb, concurrency)
+        finally:
+            _active_runs.discard(int(ch_id))
+
+    async def _fast_index_run(self, client, entity, limit, progress_cb,
+                              concurrency):
+        ch_id = entity.id
         actual_batch = _get_batch_size()
         cur_c = min(concurrency, 8)
         # min_c must never exceed max_c: with concurrency < 3 the old
@@ -361,12 +371,24 @@ class ChannelIndexer:
         # which is exactly the direction that provokes flood-waits.
         min_c, max_c = min(3, concurrency), max(3, concurrency)
         flood_w, clean_b = [0], [0]
+        # Resume point: the highest message id already indexed for this
+        # channel (0 on a first run). Everything at or below it is skipped.
+        wm = self.db.get_watermark(ch_id)
 
         log.info("INDEX: %s max=%d start=%d batch=%d wm=%s",
                  _channel_display(entity), max_c, cur_c, actual_batch, wm)
 
         stats = IndexStats()
         limiter = _Limiter(cur_c)
+
+        # Best-effort sweep of scratch files orphaned by an earlier crash,
+        # OOM or SIGKILL — nothing else removes them, and a full temp dir
+        # takes the whole box down. Age-gated so in-flight downloads of a
+        # concurrent monitor are never touched.
+        try:
+            await asyncio.to_thread(sweep_temp_dir, config.TEMP_DIR)
+        except Exception:
+            pass
 
         # ── watermark bookkeeping ────────────────────────────────────────────
         # Downloads finish out of order, so the batch that lands in the queue
@@ -431,8 +453,13 @@ class ChannelIndexer:
             try:
                 async with limiter:
                     try:
-                        thumb = _pick_photo_size(msg)
-                        if thumb and isinstance(msg.media, MessageMediaPhoto):
+                        # Same classification as the monitor (media.py is the
+                        # single source of truth): photos download a
+                        # right-sized thumbnail (bandwidth), video/GIF posts
+                        # download only the poster frame — never the full
+                        # video — and everything else the media itself.
+                        thumb = download_thumb_type(msg)
+                        if thumb:
                             await client.download_media(msg, file=tmp, thumb=thumb)
                         else:
                             await msg.download_media(file=tmp)
@@ -675,7 +702,6 @@ class ChannelIndexer:
                 models.mark_vectors_indexed()
             except Exception as exc:
                 log.warning("Could not record model fingerprint: %s", exc)
-        _active_runs.discard(int(ch_id))
         return stats.embedded
 
     def _flush(self, ids, paths, metas):

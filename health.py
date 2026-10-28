@@ -1,6 +1,5 @@
 import os
 import signal
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 

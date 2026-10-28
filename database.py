@@ -420,13 +420,13 @@ class VectorDB:
                 f"({n}/{len(metadatas)}/{embs.shape[0]})")
 
         if len(set(ids)) != n:
+            dups = n - len(set(ids))
             last = {sid: i for i, sid in enumerate(ids)}
             ids = list(dict.fromkeys(ids))
             metadatas = [metadatas[last[sid]] for sid in ids]
             embs = embs[[last[sid] for sid in ids]]
             n = len(ids)
-            log.warning("upsert: collapsed %d duplicate ids in batch",
-                        n and (len(set(ids)) - n) or 0)
+            log.warning("upsert: collapsed %d duplicate ids in batch", dups)
 
         dim = embs.shape[1]
         con = _connect()
