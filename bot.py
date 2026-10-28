@@ -90,6 +90,11 @@ def _fmt(hits):
                      f"    📅 {(h.get('date') or '')[:10]}\n")
     if any(h.get("private") for h in hits[:10]):
         lines.append("\n🔒 = private channel")
+    top_sim = hits[0].get("similarity", 0) if hits else 0
+    if hits and top_sim < 0.65:
+        lines.append("\n⚠️ Low confidence — no strong match in the index.")
+    elif hits and top_sim < 0.80:
+        lines.append("\n🟡 Moderate match — verify before acting.")
     return "\n".join(lines)
 
 
@@ -576,7 +581,6 @@ class SearchBot:
             f"/duplicates — find duplicates\n"
             f"/export — download DB\n"
             f"/import — upload DB\n"
-            f"/autotune — optimize\n"
             f"/tune — manual override\n"
             f"/system — server stats\n"
             f"/stats — DB stats",
@@ -642,16 +646,6 @@ class SearchBot:
                  f"🔄 Tasks: {len(self._tasks)} | Monitor: {mon}\n")
         await update.message.reply_text(text, parse_mode="Markdown")
 
-    # ── /autotune ─────────────────────────────────────────────────────────────
-
-    async def cmd_autotune(self, update: Update, _):
-        if not _admin(update.effective_user.id):
-            return await update.message.reply_text("⛔")
-        from auto_scale import format_auto_tune, apply_tune
-        await asyncio.to_thread(apply_tune, self.embedder.model_size_mb)
-        text = await asyncio.to_thread(format_auto_tune, self.embedder.model_size_mb)
-        await update.message.reply_text(text + "\n✅ _Applied._", parse_mode="Markdown")
-
     # ── /tune ─────────────────────────────────────────────────────────────────
 
     async def cmd_tune(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -667,12 +661,24 @@ class SearchBot:
         args = list(ctx.args or []) if ctx else []
         usage = (
             "⚙️ /tune — manual hardware tuning\n\n"
-            "/tune — show current settings\n"
-            "/tune intra=4 inter=1 batch=32 parallel=8\n"
-            "/tune reset — back to automatic\n\n"
-            "intra/inter: ONNX threads (1-32 / 1-8)\n"
-            "batch: images per embedding batch (1-256)\n"
-            "parallel: parallel downloads (1-32)"
+            "No auto-tune command anymore: settings are detected automatically\n"
+            "from your CPU/RAM/container limits at startup and on every /model\n"
+            "switch. Use /tune only to override them.\n\n"
+            "How to tune:\n"
+            "1. Run /tune (no args) to see detected CPU/RAM and applied values.\n"
+            "2. Pick values for your box:\n"
+            "   • intra = number of PHYSICAL CPU cores (max 16) — biggest speedup\n"
+            "   • inter = 1 (keep 1 unless you have spare cores)\n"
+            "   • batch = 8 for ViT-L/14 (293MB), 32 for ViT-B, 64 for tiny models\n"
+            "   • parallel = CPU cores x2, capped at 16\n"
+            "3. Apply: /tune intra=4 inter=1 batch=8 parallel=8\n"
+            "4. /tune reset — discard overrides, back to auto-detect\n\n"
+            "Examples:\n"
+            "  /tune intra=2 batch=4        (small 1-CPU box)\n"
+            "  /tune intra=8 batch=16 parallel=12\n"
+            "  /tune reset\n\n"
+            "Bounds: intra 1-32, inter 1-8, batch 1-256, parallel 1-32.\n"
+            "Thread changes rebuild the model session automatically."
         )
         wanted: dict = {}
         do_reset = False
@@ -1704,7 +1710,6 @@ class SearchBot:
         app.add_handler(CommandHandler("status",        self.cmd_stats))
         app.add_handler(CommandHandler("system",        self.cmd_system))
         app.add_handler(CommandHandler("session",       self.cmd_session))
-        app.add_handler(CommandHandler("autotune",      self.cmd_autotune))
         app.add_handler(CommandHandler("tune",          self.cmd_tune))
         app.add_handler(CommandHandler("export",        self.cmd_export))
         app.add_handler(CommandHandler("duplicates",    self.cmd_duplicates))

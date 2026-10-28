@@ -206,6 +206,10 @@ class VectorDB:
         self._closed = False
         self._close_initiated = False
         self._count_cache = None
+        # Cached mean of all stored embeddings, used for hubness-corrected
+        # (centered) re-ranking in query(). Invalidated on every write.
+        self._db_mean = None
+        self._db_mean_rev = -1
         self._hnsw_saver = threading.Thread(
             target=self._hnsw_saver_loop, name="hnsw-saver", daemon=True)
 
@@ -486,6 +490,8 @@ class VectorDB:
 
         self._db_rev = rev
         self._count_cache = None
+        self._db_mean = None
+        self._db_mean_rev = -1
 
         try:
             with self._hnsw_mu:
@@ -514,10 +520,10 @@ class VectorDB:
         empty = {"ids": [[]], "metadatas": [[]], "distances": [[]]}
         if self._hnsw is None or not self._hnsw.size:
             return empty
-        q = np.asarray(embedding, dtype=np.float32).reshape(1, -1)
-        if self.dim is not None and q.shape[1] != self.dim:
+        q = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        if self.dim is not None and q.shape[0] != self.dim:
             raise RuntimeError(
-                f"Query is {q.shape[1]}-dim but the index holds "
+                f"Query is {q.shape[0]}-dim but the index holds "
                 f"{self.dim}-dim vectors — the model changed; run /index.")
         # If the in-memory graph fell behind (mirror failure), rebuild before
         # serving so results are never stale.
@@ -525,33 +531,92 @@ class VectorDB:
             log.warning("ANN graph stale (rev %s vs %s) — rebuilding",
                         self._graph_rev, self._db_rev)
             self._rebuild_hnsw()
-        n = max(1, min(int(n), int(self._hnsw.size)))
-        res = self._hnsw.search(q, count=n, exact=True)
-        pairs = []
-        for k, d in zip(res.keys, res.distances):
-            sid = self._key2sid.get(int(k))
-            if sid is not None:
-                pairs.append((sid, float(d)))
-        if not pairs:
+        size = int(self._hnsw.size)
+        n = max(1, min(int(n), size))
+
+        # Hubness-corrected re-ranking (Nearest-Neighbor / distribution
+        # normalisation). CLIP-family embeddings suffer from "hubs" that
+        # dominate the nearest-neighbour lists, so a query for an image that IS
+        # in the index can still return a different image as the top hit. We
+        # keep the raw cosine for the reported similarity (so the existing
+        # 0-1 scale and thresholds stay meaningful) but ORDER the results by a
+        # centred cosine, which down-weights hubs. The candidate pool is taken
+        # from the exact raw-cosine top-K so the re-rank never has to load the
+        # whole table; the true match of a photo query is always within a few
+        # dozen positions by raw cosine.
+        K = min(size, max(n * 8, 64))
+        res = self._hnsw.search(q.reshape(1, -1), count=K, exact=True)
+        cand_keys = [int(k) for k in res.keys]
+        cand_dists = [float(d) for d in res.distances]
+        cand_sids = [self._key2sid.get(k) for k in cand_keys]
+        # keep only resolvable
+        usable = [(k, sid, dist) for k, sid, dist in zip(cand_keys, cand_sids, cand_dists)
+                  if sid is not None]
+        if not usable:
             return empty
-        qmarks = ",".join("?" * len(pairs))
-        metas = {
-            sid: json.loads(mtext) if mtext else {}
-            for sid, mtext in self._sql(
-                f"SELECT id, metadata FROM vectors WHERE id IN ({qmarks})",
-                [s for s, _ in pairs], fetch="all")
-        }
-        out_ids, out_metas, out_dists = [], [], []
-        for sid, dist in pairs:
-            if sid not in metas:
+
+        # Cached mean of the DB embeddings, invalidated on writes.
+        if self._db_mean is None or self._db_mean_rev != self._db_rev:
+            self._db_mean = self._compute_db_mean()
+            self._db_mean_rev = self._db_rev
+
+        # Load the candidate embeddings from SQLite for centred scoring.
+        cand_sid_list = [u[1] for u in usable]
+        qmarks = ",".join("?" * len(cand_sid_list))
+        rows = self._sql(
+            f"SELECT id, embedding, metadata FROM vectors WHERE id IN ({qmarks})",
+            cand_sid_list, fetch="all")
+        meta_by_sid = {r[0]: (json.loads(r[2]) if r[2] else {}) for r in rows}
+        emb_by_sid = {r[0]: np.frombuffer(r[1], dtype=np.float32) for r in rows}
+
+        mu = self._db_mean
+        qc = q - (mu if mu is not None else 0.0)
+        qn = float(np.linalg.norm(qc)) or 1.0
+
+        scored = []
+        for key, sid, raw_dist in usable:
+            if sid not in emb_by_sid:
                 continue
+            cvec = emb_by_sid[sid]
+            if self.dim is not None and cvec.shape[0] != self.dim:
+                continue
+            cc = cvec - (mu if mu is not None else 0.0)
+            cn = float(np.linalg.norm(cc)) or 1.0
+            centered_sim = float(np.dot(cc, qc) / (cn * qn))
+            meta = meta_by_sid.get(sid, {})
+            scored.append((sid, meta, raw_dist, centered_sim))
+
+        if not scored:
+            return empty
+        # Order by centred similarity (descending); tie-break by raw distance.
+        scored.sort(key=lambda x: (-x[3], x[2]))
+        top = scored[:n]
+
+        out_ids, out_metas, out_dists = [], [], []
+        for sid, meta, raw_dist, _ in top:
             out_ids.append(sid)
-            out_metas.append(metas[sid])
-            out_dists.append(dist)
+            out_metas.append(meta)
+            out_dists.append(raw_dist)
         if not out_ids:
             return empty
         return {"ids": [out_ids], "metadatas": [out_metas],
                 "distances": [out_dists]}
+
+    def _compute_db_mean(self):
+        # Mean of all stored (unit-normalised) embeddings. Cached per revision.
+        total = self.count()
+        if total == 0:
+            return None
+        acc = None
+        cnt = 0
+        for ids, metas, embs in self.iter_vectors(page=1000):
+            if acc is None:
+                acc = np.zeros(embs.shape[1], dtype=np.float64)
+            acc += embs.astype(np.float64).sum(axis=0)
+            cnt += embs.shape[0]
+        if cnt == 0:
+            return None
+        return (acc / cnt).astype(np.float32)
 
     @_serialized
     def count(self):
@@ -591,6 +656,8 @@ class VectorDB:
             con.close()
         self._db_rev = rev
         self._count_cache = None
+        self._db_mean = None
+        self._db_mean_rev = -1
         try:
             with self._hnsw_mu:
                 if self._hnsw is not None:

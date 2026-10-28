@@ -12,9 +12,9 @@ class ImageSearcher:
     def search(self, *, path=None, data=None, n=None):
         n = n or config.MAX_RESULTS
         if data:
-            emb = self.embedder.embed_bytes(data)
+            emb = self.embedder.embed_bytes_query(data)
         elif path:
-            emb = self.embedder.embed_path(path)
+            emb = self.embedder.embed_path_query(path)
         else:
             raise ValueError("supply path or data")
         if self.db.count() == 0:

@@ -341,6 +341,29 @@ class CLIPEmbedder:
         with Image.open(BytesIO(data)) as im:
             return self._run(None, [im]).flatten().tolist()
 
+    def embed_bytes_query(self, data):
+        """
+        Embed a QUERY image with light test-time augmentation (horizontal flip)
+        averaged into a single vector. The index stores single (non-TTA) vectors,
+        so this is "query expansion": it makes the query embedding more robust to
+        Telegram's recompression and small alignment differences, improving
+        recall without requiring a re-index.
+        """
+        self._check()
+        with Image.open(BytesIO(data)) as im:
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            variants = [im, im.transpose(Image.FLIP_LEFT_RIGHT)]
+            out = self._run(None, variants)   # (2, d), already unit-normalised
+            return self._norm(out.mean(axis=0)).flatten().tolist()
+
+    def embed_path_query(self, path):
+        self._check()
+        with Image.open(path) as im:
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            variants = [im, im.transpose(Image.FLIP_LEFT_RIGHT)]
+            out = self._run(None, variants)
+            return self._norm(out.mean(axis=0)).flatten().tolist()
+
     def embed_batch(self, paths):
         self._check()
         indices, images = [], []
