@@ -114,8 +114,13 @@ def detect_specs() -> dict:
 # and the vector store — which is how auto-tune used to OOM 2 GB boxes with a
 # 1.8 GB model.
 _REC_HEADROOM = 1.35
-_REC_ORDER = ("vit-l-14-336", "vit-l-14", "vit-b-16", "vit-b-32")
-_REC_NOTES = {"vit-l-14-336": "best accuracy", "vit-l-14": "224px",
+_REC_ORDER = ("siglip-large-patch16-384", "vit-l-14-336", "siglip-base-patch16-224",
+              "vit-l-14", "siglip2-base-patch16-224", "vit-b-16", "vit-b-32")
+_REC_NOTES = {"siglip-large-patch16-384": "best retrieval quality",
+              "vit-l-14-336": "best general accuracy (CLIP)",
+              "siglip-base-patch16-224": "strong retrieval, fast",
+              "vit-l-14": "224px",
+              "siglip2-base-patch16-224": "newer SigLIP2, fast",
               "vit-b-16": "balanced", "vit-b-32": "lightweight"}
 
 

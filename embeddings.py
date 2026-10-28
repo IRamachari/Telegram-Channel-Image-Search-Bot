@@ -56,6 +56,9 @@ class CLIPEmbedder:
         # Per-model preprocessing, resolved in _try_load().
         self.input_size = _DEFAULT_INPUT
         self.crop_mode = "center"
+        self.mean = MEAN.copy()
+        self.std = STD.copy()
+        self.resample = 3
         self._lock = threading.Lock()
         # Inference / index-run counters. reload() refuses to swap the session
         # while either is non-zero: swapping mid-batch would mix two feature
@@ -75,7 +78,10 @@ class CLIPEmbedder:
         change. Only when the shape is dynamic do we fall back to what the
         model registry declares, and finally to 224.
         """
-        settings = {"crop": "center", "input": _DEFAULT_INPUT}
+        settings = {"crop": "center", "input": _DEFAULT_INPUT,
+                    "mean": [0.48145466, 0.4578275, 0.40821073],
+                    "std": [0.26862954, 0.26130258, 0.27577711],
+                    "resample": 3}
         try:
             from models import get_active_settings
             settings = get_active_settings()
@@ -83,6 +89,11 @@ class CLIPEmbedder:
             pass
         crop = str(settings.get("crop", "center"))
         declared = int(settings.get("input", _DEFAULT_INPUT) or _DEFAULT_INPUT)
+        mean = np.asarray(settings.get("mean", [0.48145466, 0.4578275, 0.40821073]),
+                          dtype=np.float32)
+        std = np.asarray(settings.get("std", [0.26862954, 0.26130258, 0.27577711]),
+                         dtype=np.float32)
+        resample = int(settings.get("resample", 3) or 3)
 
         detected = None
         try:
@@ -95,8 +106,8 @@ class CLIPEmbedder:
         except Exception:
             detected = None
         size = detected or declared
-        log.info("CLIP preprocessing: %dpx input, crop=%s", size, crop)
-        return crop, size
+        log.info("CLIP preprocessing: %dpx input, crop=%s, resample=%d", size, crop, resample)
+        return crop, size, mean, std, resample
 
     @staticmethod
     def _options(intra: int, inter: int):
@@ -164,7 +175,7 @@ class CLIPEmbedder:
                     providers=["CPUExecutionProvider"],
                 )
                 name = session.get_inputs()[0].name
-                crop, input_size = self._resolve_settings(session)
+                crop, input_size, mean, std, resample = self._resolve_settings(session)
             except Exception as exc:
                 self.last_error = str(exc)
                 log.error("Failed to load model (previous session kept): %s",
@@ -173,6 +184,8 @@ class CLIPEmbedder:
             # Commit — nothing above this line mutated the live session.
             self.session, self.input_name = session, name
             self.crop_mode, self.input_size = crop, input_size
+            self.mean, self.std = mean, std
+            self.resample = resample
             self.model_size_mb = size_mb
             self.last_error = None
             log.info("CLIP ready. Input: %s (%dpx, %s crop)",
@@ -236,7 +249,7 @@ class CLIPEmbedder:
         #    finds the wrong image". Full decode matches the reliable v1.
         img = img.convert("RGB")
         if self.crop_mode == "stretch":
-            img = img.resize((target, target), Image.BICUBIC, reducing_gap=2.0)
+            img = img.resize((target, target), Image.BICUBIC if self.resample >= 3 else Image.BILINEAR, reducing_gap=2.0)
         else:
             w, h = img.size
             if w < h:
@@ -244,7 +257,7 @@ class CLIPEmbedder:
             else:
                 nw, nh = int(w * target / h + 0.5), target
             # reducing_gap only engages for large downscales; a free win then.
-            img = img.resize((nw, nh), Image.BICUBIC, reducing_gap=2.0)
+            img = img.resize((nw, nh), Image.BICUBIC if self.resample >= 3 else Image.BILINEAR, reducing_gap=2.0)
             left = (nw - target) // 2
             top = (nh - target) // 2
             img = img.crop((left, top, left + target, top + target))
@@ -252,8 +265,8 @@ class CLIPEmbedder:
         # np.asarray avoids Pillow's copy; in-place ops avoid two more temporaries.
         arr = np.asarray(img, dtype=np.float32)
         arr *= np.float32(1.0 / 255.0)
-        arr -= MEAN
-        arr /= STD
+        arr -= self.mean
+        arr /= self.std
         # transpose() is a view; ascontiguousarray makes the actual (3,H,W) copy.
         return np.ascontiguousarray(arr.transpose(2, 0, 1))
 
@@ -285,8 +298,16 @@ class CLIPEmbedder:
             with self._lock:
                 self._active_runs -= 1
         emb = outs[-1] if len(outs) > 1 else outs[0]
+        # Prefer a pooled 2-D embedding when the model exposes several outputs
+        # (e.g. SigLIP ships last_hidden_state + pooler_output). Fall back to
+        # the last output, which is the pooled one for every model here.
+        names = [o.name for o in session.get_outputs()]
+        for preferred in ("pooler_output", "image_embeds", "embedding"):
+            if preferred in names:
+                emb = outs[names.index(preferred)]
+                break
         if len(emb.shape) == 3:
-            emb = emb[:, 0, :]
+            emb = emb.mean(axis=1)
         return self._norm(emb)
 
     def _check(self):

@@ -37,13 +37,17 @@ A self-hosted Telegram bot that indexes images from your Telegram channels and l
 | Key | Model | Size | RAM | Input | Notes |
 |-----|-------|------|-----|-------|-------|
 | `vit-b-32` | CLIP ViT-B/32 | 85 MB | 350 MB | 224 px | Fastest, general use |
-| `vit-b-16` | CLIP ViT-B/16 | 110 MB | 500 MB | 224 px | Better detail, handles edits |
-| `vit-l-14` | CLIP ViT-L/14 | 350 MB | 1.2 GB | 224 px | High accuracy |
-| `vit-l-14-336` | CLIP ViT-L/14 @336 | 307 MB | 1.8 GB | 336 px | **Best general accuracy** |
+| `vit-b-16` | CLIP ViT-B/16 | 83 MB | 500 MB | 224 px | Better detail, handles edits |
+| `vit-l-14` | CLIP ViT-L/14 | 293 MB | 1.2 GB | 224 px | High accuracy |
+| `vit-l-14-336` | CLIP ViT-L/14 @336 | 307 MB | 1.8 GB | 336 px | **Best general accuracy (CLIP)** |
+| `siglip-base-patch16-224` | SigLIP Base/16 | 95 MB | 400 MB | 224 px | Stronger retrieval, fast, small servers |
+| `siglip-large-patch16-384` | SigLIP Large/16 @384 | 314 MB | 1.4 GB | 384 px | **Highest retrieval quality** |
+| `siglip2-base-patch16-224` | SigLIP2 Base/16 | 90 MB | 400 MB | 224 px | Newer SigLIP2, fast, small servers |
 
 Use `/model` to download and switch. The input resolution and crop mode are read
 from the model file (and the recorded model settings), so 224 px and 336 px models
-both work without any configuration.
+both work without any configuration. SigLIP models use their own normalisation
+(mean/std 0.5) and square resize, which is handled automatically per model.
 
 **Changing the model invalidates the existing vectors.** A different embedding
 dimension makes the store reject the next insert outright; a same-dimension model
