@@ -219,6 +219,21 @@ class ChannelMonitor:
             log.warning("Monitor hot-add failed for %s: %s", channel_id, exc)
             return False
 
+    def unwatch(self, channel_id) -> None:
+        """
+        Stop matching events for a channel removed from the index (/channels).
+
+        `_watch_ids` stores unmarked entity ids, so the lookup goes through
+        the same normaliser the NewMessage handler uses; a stored id the
+        monitor could never resolve is simply already absent — a no-op.
+        Safe to call whether or not the monitor is running.
+        """
+        try:
+            sid = _unmarked(channel_id)
+        except Exception:
+            return
+        self._watch_ids.discard(sid)
+
     async def _handle_new(self, event):
         if not self.running:
             return

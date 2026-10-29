@@ -183,37 +183,52 @@ def _create_zip(db: VectorDB) -> bytes:
     return buf.getvalue()
 
 
-def export_db(db: VectorDB) -> list[tuple[bytes, str, dict]]:
+def export_db_single(db: VectorDB) -> tuple[bytes, str, dict]:
+    """
+    Build ONE zip holding the whole store (the /export single-file format).
+
+    Returns (zip_bytes, filename, stats). Callers decide how to deliver the
+    bytes: Bot API up to ~50 MB, MTProto beyond, split_backup() as the
+    last-resort fallback.
+    """
     zip_bytes = _create_zip(db)
     label = _get_channel_label(db)
     ts = time.strftime("%Y%m%d_%H%M%S")
     raw_mb = get_db_size_mb()
     zip_mb = len(zip_bytes) / 1024 / 1024
     vectors = db.count()
-
     stats = {
         "vectors": vectors,
         "raw_mb": round(raw_mb, 1),
         "zip_mb": round(zip_mb, 1),
         "channels": label,
     }
+    return zip_bytes, f"backup_{label}_{ts}.zip", stats
 
-    if len(zip_bytes) <= PART_SIZE:
-        name = f"backup_{label}_{ts}.zip"
-        return [(zip_bytes, name, stats)]
 
-    parts = []
-    total = len(zip_bytes)
-    num_parts = (total + PART_SIZE - 1) // PART_SIZE
-    stats["parts"] = num_parts
+def split_backup(data: bytes, name: str, stats: dict) -> list[tuple[bytes, str, dict]]:
+    """
+    Split a complete single-file backup into the legacy multi-part chunks
+    (backup_..._ts.partNNofMM). Small files stay whole. Filenames must keep
+    matching the /import regex so old parts remain importable.
+    """
+    if len(data) <= PART_SIZE:
+        return [(data, name, stats)]
+    num = (len(data) + PART_SIZE - 1) // PART_SIZE
+    stats = dict(stats)
+    stats["parts"] = num
+    base = name[:-4] if name.endswith(".zip") else name
+    return [
+        (data[i * PART_SIZE:(i + 1) * PART_SIZE],
+         f"{base}.part{i + 1:02d}of{num:02d}", stats)
+        for i in range(num)
+    ]
 
-    for i in range(num_parts):
-        start = i * PART_SIZE
-        chunk = zip_bytes[start:start + PART_SIZE]
-        pname = f"backup_{label}_{ts}.part{i + 1:02d}of{num_parts:02d}"
-        parts.append((chunk, pname, stats))
 
-    return parts
+def export_db(db: VectorDB) -> list[tuple[bytes, str, dict]]:
+    """Legacy multi-part export (kept for compatibility with the /import
+    parts path): single file when small, chunks when large."""
+    return split_backup(*export_db_single(db))
 
 
 def import_db(zip_bytes: bytes) -> dict:

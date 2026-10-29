@@ -703,6 +703,94 @@ class VectorDB:
                 break
         return results
 
+    def channel_overview(self) -> dict[int, dict]:
+        """
+        Per-channel bookkeeping for the /channels panel.
+
+        A "channel" groups rows by their true channel id — both the
+        channel_id column and (for legacy rows whose column is NULL) the id
+        inside the metadata JSON, exactly the two shapes get_ids_for_channel()
+        matches, so any key returned here is a valid forget_channel() target.
+
+        Returns: {true_channel_id: {"name": str, "count": int, "watermark": int}}
+        """
+        out: dict[int, dict] = {}
+        with _DIR_LOCK:
+            con = _connect()
+            try:
+                rows = con.execute(
+                    "SELECT channel_id, COUNT(*) FROM vectors "
+                    "GROUP BY channel_id").fetchall()
+                for cid, cnt in rows:
+                    if cid is None:
+                        continue
+                    e = out.setdefault(int(cid), {"name": str(cid), "count": 0})
+                    e["count"] += int(cnt)
+                    if e["name"] == str(cid):
+                        srow = con.execute(
+                            "SELECT metadata FROM vectors WHERE channel_id = ? "
+                            "AND metadata IS NOT NULL LIMIT 1", (cid,)).fetchone()
+                        if srow:
+                            try:
+                                nm = (json.loads(srow[0]) or {}).get("channel_name")
+                            except Exception:
+                                nm = None
+                            if nm:
+                                e["name"] = str(nm)
+                # Legacy rows (NULL column value) keep the channel in metadata.
+                page, last = 1000, ""
+                for _ in range(100_000):
+                    nrows = con.execute(
+                        "SELECT id, metadata FROM vectors "
+                        "WHERE channel_id IS NULL AND id > ? ORDER BY id LIMIT ?",
+                        (last, page)).fetchall()
+                    if not nrows:
+                        break
+                    for doc_id, mtext in nrows:
+                        last = doc_id
+                        try:
+                            meta = json.loads(mtext) if mtext else {}
+                        except Exception:
+                            meta = {}
+                        cid = _channel_id_of(meta)
+                        if cid is None:
+                            continue
+                        e = out.setdefault(cid, {"name": str(cid), "count": 0})
+                        e["count"] += 1
+                        nm = meta.get("channel_name")
+                        if nm and e["name"] == str(cid):
+                            e["name"] = str(nm)
+            finally:
+                con.close()
+        wm = self.list_channels()
+        for tid, e in out.items():
+            w = wm.get(_norm_channel_id(tid))
+            if w is not None:
+                e["watermark"] = int(w)
+        return out
+
+    def forget_channel(self, channel_id: int) -> int:
+        """
+        Remove a channel entirely: delete every vector that belongs to it
+        (column id or metadata id — same matching as get_ids_for_channel) and
+        drop its monitor watermark. Returns the vector count removed.
+
+        Deliberately NOT @_serialized: delete() takes _DIR_LOCK per chunk and
+        that lock is not re-entrant.
+        """
+        docs = self.get_ids_for_channel(channel_id)
+        ids = [d["id"] for d in docs]
+        total = len(ids)
+        for i in range(0, total, 1000):
+            self.delete(ids[i:i + 1000])
+        key = _norm_channel_id(channel_id)
+        with self._state_lock:
+            if self._state.pop(key, None) is not None:
+                self._state_dirty = True
+                self._state_written.clear()
+        self._flush_state()
+        return total
+
     @_serialized
     def paged_get(self, where=None, include=("ids",), page: int = 1000):
         if "embeddings" in include:

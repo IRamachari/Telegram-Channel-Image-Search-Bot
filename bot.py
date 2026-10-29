@@ -4,10 +4,12 @@ import io as io_module
 import logging
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove,
@@ -32,6 +34,7 @@ log = logging.getLogger(__name__)
 LOGIN_PHONE, LOGIN_CODE, LOGIN_2FA = range(3)
 INDEX_CHANNEL, INDEX_LIMIT = range(10, 12)
 IMPORT_WAITING = 20
+TUNE_WAIT = 30
 
 # A valid backup part is exactly what export_db() produces:
 #   backup_<label>_<YYYYMMDD>_<HHMMSS>.partNNofMM
@@ -708,12 +711,13 @@ class SearchBot:
             f"*Tools:*\n"
             f"/monitor — monitor status / toggle\n"
             f"/checkupdates — sync new images now\n"
+            f"/channels — manage indexed channels\n"
             f"/setpinned — pin live status message\n"
             f"/cleanup — remove deleted vectors\n"
             f"/duplicates — find duplicates\n"
-            f"/export — download DB\n"
+            f"/export — download DB (single file)\n"
             f"/import — upload DB\n"
-            f"/tune — manual override\n"
+            f"/tune — tuning guide + override\n"
             f"/system — server stats\n"
             f"/stats — DB stats",
             parse_mode="Markdown",
@@ -780,63 +784,34 @@ class SearchBot:
 
     # ── /tune ─────────────────────────────────────────────────────────────────
 
-    async def cmd_tune(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async def _tune_apply(self, args) -> str:
         """
-        Manual override of the auto-detected performance settings, persisted
-        in tune.json so it survives restarts (auto_scale loads the file at
-        import, so a fresh process applies the same values on first load).
+        Apply /tune overrides and return the resulting status text. Shared by
+        the direct-with-args path and the interactive 60 s window.
+
+        Raises ValueError on bad input (caller formats it).
         """
-        if not _admin(update.effective_user.id):
-            return await update.message.reply_text("⛔")
         from auto_scale import (_ALIASES, apply_tune, format_auto_tune,
                                 reset_tune, set_tune)
-        args = list(ctx.args or []) if ctx else []
-        usage = (
-            "⚙️ /tune — manual hardware tuning\n\n"
-            "No auto-tune command anymore: settings are detected automatically\n"
-            "from your CPU/RAM/container limits at startup and on every /model\n"
-            "switch. Use /tune only to override them.\n\n"
-            "How to tune:\n"
-            "1. Run /tune (no args) to see detected CPU/RAM and applied values.\n"
-            "2. Pick values for your box:\n"
-            "   • intra = number of PHYSICAL CPU cores (max 16) — biggest speedup\n"
-            "   • inter = 1 (keep 1 unless you have spare cores)\n"
-            "   • batch = 8 for ViT-L/14 (293MB), 32 for ViT-B, 64 for tiny models\n"
-            "   • parallel = CPU cores x2, capped at 16\n"
-            "3. Apply: /tune intra=4 inter=1 batch=8 parallel=8\n"
-            "4. /tune reset — discard overrides, back to auto-detect\n\n"
-            "Examples:\n"
-            "  /tune intra=2 batch=4        (small 1-CPU box)\n"
-            "  /tune intra=8 batch=16 parallel=12\n"
-            "  /tune reset\n\n"
-            "Bounds: intra 1-32, inter 1-8, batch 1-256, parallel 1-32.\n"
-            "Thread changes rebuild the model session automatically."
-        )
         wanted: dict = {}
         do_reset = False
-        try:
-            for a in args:
-                if a.lower() == "reset":
-                    do_reset = True
-                    continue
-                k, sep, v = a.partition("=")
-                if not sep:
-                    raise ValueError(f"'{a}' is not key=value")
-                wanted[_ALIASES.get(k.lower(), k.lower())] = int(v)
-            if do_reset and wanted:
-                raise ValueError("reset cannot be combined with overrides")
-            if do_reset:
-                await asyncio.to_thread(reset_tune)
-            elif wanted:
-                await asyncio.to_thread(set_tune, **wanted)
-            # Re-apply so _applied reflects the overrides for this model size
-            # (set_tune only persists; apply_tune refreshes the live values).
-            applied = await asyncio.to_thread(
-                apply_tune, self.embedder.model_size_mb)
-        except ValueError as e:
-            return await update.message.reply_text(f"⚠️ {e}\n\n{usage}")
-        except Exception as e:
-            return await update.message.reply_text(f"⚠️ {e}")
+        for a in args:
+            if a.lower() == "reset":
+                do_reset = True
+                continue
+            k, sep, v = a.partition("=")
+            if not sep:
+                raise ValueError(f"'{a}' is not key=value")
+            wanted[_ALIASES.get(k.lower(), k.lower())] = int(v)
+        if do_reset and wanted:
+            raise ValueError("reset cannot be combined with overrides")
+        if do_reset:
+            await asyncio.to_thread(reset_tune)
+        elif wanted:
+            await asyncio.to_thread(set_tune, **wanted)
+        # Re-apply so _applied reflects the overrides for this model size
+        # (set_tune only persists; apply_tune refreshes the live values).
+        applied = await asyncio.to_thread(apply_tune, self.embedder.model_size_mb)
         # Thread counts are baked into the ONNX session at build time, so a
         # changed intra/inter needs a session rebuild. Batch size and parallel
         # downloads are read per-run and take effect immediately.
@@ -854,7 +829,88 @@ class SearchBot:
                 note = ("\nℹ️ No model loaded — threads apply at the next "
                         "model load.")
         text = await asyncio.to_thread(format_auto_tune, self.embedder.model_size_mb)
-        await update.message.reply_text(text + note, parse_mode="Markdown")
+        return text + note
+
+    _TUNE_GUIDE = (
+        "⚙️ *Tuning guide*\n\n"
+        "Settings are detected automatically from your CPU/RAM/container "
+        "limits at startup and on every /model switch — use /tune only to "
+        "override them.\n\n"
+        "*How to tune*\n"
+        "1. Read the detected values from the last tune status.\n"
+        "2. Pick values for your box:\n"
+        "   • `intra` = number of PHYSICAL CPU cores (max 16) — biggest speedup\n"
+        "   • `inter` = 1 (keep 1 unless you have spare cores)\n"
+        "   • `batch` = 8 for ViT-L/14 (293 MB), 32 for ViT-B, 64 for tiny models\n"
+        "   • `parallel` = CPU cores ×2, capped at 16\n"
+        "3\\. *Reply to this message* with your settings within 60 s "
+        "(or use `/tune intra=4 inter=1 batch=8 parallel=8` directly)\n"
+        "4. `reset` — discard overrides, back to auto-detect\n\n"
+        "*Examples*\n"
+        "`intra=2 batch=4` — small 1-CPU box\n"
+        "`intra=8 batch=16 parallel=12` — big server\n"
+        "`reset` — back to auto-detect\n\n"
+        "Bounds: intra 1-32, inter 1-8, batch 1-256, parallel 1-32.\n"
+        "Thread changes rebuild the model session automatically.\n\n"
+        "⏳ *Send your settings now — this window closes in 60 seconds.* "
+        "(/cancel to leave)"
+    )
+
+    async def cmd_tune(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """
+        /tune — tuning guide + interactive 60 s input window.
+
+        Cached manual overrides are persisted in tune.json so they survive
+        restarts (auto_scale loads the file at import, so a fresh process
+        applies the same values on first load).
+        """
+        if not _admin(update.effective_user.id):
+            await update.message.reply_text("⛔")
+            return ConversationHandler.END
+        args = list(ctx.args or []) if ctx else []
+        if args:
+            # Direct application: /tune intra=2 batch=8 / /tune reset
+            try:
+                text = await self._tune_apply(args)
+            except ValueError as e:
+                await update.message.reply_text(f"⚠️ {e}")
+            except Exception as e:
+                await update.message.reply_text(f"⚠️ {e}")
+            else:
+                await update.message.reply_text(text, parse_mode="Markdown")
+            return ConversationHandler.END
+        await update.message.reply_text(self._TUNE_GUIDE, parse_mode="Markdown")
+        return TUNE_WAIT
+
+    async def tune_input(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Plain-text reply inside the /tune window: parse + apply + END."""
+        text = update.message.text.strip()
+        if not text:
+            return TUNE_WAIT
+        try:
+            applied = await self._tune_apply(text.split())
+        except ValueError as e:
+            await update.message.reply_text(
+                f"⚠️ {e}\n\nExamples:\n`intra=2 batch=4`\n`intra=8 batch=16 parallel=12`\n`reset`",
+                parse_mode="Markdown")
+            return TUNE_WAIT
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ {e}", parse_mode="Markdown")
+            return ConversationHandler.END
+        await update.message.reply_text(applied, parse_mode="Markdown")
+        return ConversationHandler.END
+
+    async def tune_timeout(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """The 60 s /tune input window expired."""
+        eff = getattr(update, "effective_message", None)
+        if eff is not None:
+            try:
+                await eff.reply_text(
+                    "⌛ Tune window ended (60 s). Run /tune again.",
+                    parse_mode="Markdown")
+            except Exception:
+                pass
+        return ConversationHandler.END
 
     # ── /cancel ───────────────────────────────────────────────────────────────
 
@@ -1055,6 +1111,8 @@ class SearchBot:
 
     # ── /export ───────────────────────────────────────────────────────────────
 
+    _HTTP_UPLOAD_SAFE = 45 * 1024 * 1024  # Bot API sendDocument cap ≈ 50 MB
+
     async def cmd_export(self, update: Update, _):
         if not _admin(update.effective_user.id):
             return await update.message.reply_text("⛔")
@@ -1062,42 +1120,71 @@ class SearchBot:
             return await update.message.reply_text("❌ Empty DB.")
         msg = await update.message.reply_text("📦 Preparing …")
         try:
-            from db_manager import export_db
+            from db_manager import export_db_single, split_backup
             # The zip is built from the live directory, so it must not overlap a
             # write: a page captured mid-transaction yields a silently corrupt
             # backup that only fails at /import time.
             async with self._db_lock:
-                parts = await asyncio.to_thread(export_db, self.db)
-            stats = parts[0][2]
+                data, name, stats = await asyncio.to_thread(export_db_single, self.db)
+            mb = len(data) / 1024 / 1024
+            caption = (f"🗄 Backup: {stats['channels']}\n"
+                       f"Vectors: {stats['vectors']:,} | {mb:.1f} MB")
+            # Single file, ALWAYS — the /import side takes the native zip in
+            # one piece (MTProto download has no size cap).
+            if len(data) <= self._HTTP_UPLOAD_SAFE:
+                await _edit(msg, f"📦 Uploading ({mb:.0f} MB) …", parse_mode="Markdown")
+                doc = io_module.BytesIO(data)
+                doc.name = name
+                await update.message.reply_document(document=doc, caption=caption)
+                await _edit(msg, "✅ Export sent!", parse_mode="Markdown")
+                return
+            client = await self._get_mtproto()
+            if client is not None:
+                try:
+                    await _edit(msg, f"📦 Uploading single file via MTProto "
+                                     f"({mb:.0f} MB, no Telegram limit) …",
+                                parse_mode="Markdown")
+                    peer = await self._resolve_mtproto_peer(
+                        client, update.effective_chat.id)
+                    tmpdir = tempfile.mkdtemp(prefix="exp_", dir=config.TEMP_DIR)
+                    try:
+                        tmp = Path(tmpdir) / name
+                        try:
+                            tmp.write_bytes(data)
+                        except OSError as exc:
+                            raise RuntimeError(f"could not stage export: {exc}")
+                        await client.send_file(
+                            peer, str(tmp), caption=caption, force_document=True)
+                    finally:
+                        shutil.rmtree(tmpdir, ignore_errors=True)
+                    await _edit(msg, "✅ Export sent (single file)!", parse_mode="Markdown")
+                    return
+                except Exception as exc:
+                    log.warning("MTProto export failed (%s) — falling back to parts", exc)
+                    await _edit(msg, "⚠️ Uploading via MTProto failed — "
+                                     "sending parts as fallback …",
+                                parse_mode="Markdown")
+            else:
+                log.warning("No MTProto client — exporting in parts.")
+            # Fallback: legacy multi-part chunks (works even without
+            # API_ID/API_HASH). Parts are sliced from the already-built zip,
+            # never rebuilt.
+            parts = split_backup(data, name, stats)
             total_parts = len(parts)
-            if total_parts == 1:
-                await _edit(msg, f"📦 Uploading ({stats['zip_mb']} MB) …", parse_mode="Markdown")
-                doc = io_module.BytesIO(parts[0][0])
-                doc.name = parts[0][1]
+            for i, (pdata, pname, _) in enumerate(parts, 1):
+                doc = io_module.BytesIO(pdata)
+                doc.name = pname
+                part_mb = len(pdata) / 1024 / 1024
                 await update.message.reply_document(
                     document=doc,
-                    caption=(f"🗄 Backup: {stats['channels']}\n"
-                             f"Vectors: {stats['vectors']:,} | {stats['zip_mb']} MB"),
+                    caption=f"📦 Part {i}/{total_parts} ({part_mb:.1f} MB)",
                 )
-                await _edit(msg, "✅ Export sent!", parse_mode="Markdown")
-            else:
-                await _edit(msg,
-                    f"📦 Database is *{stats['zip_mb']} MB*\n"
-                    f"Splitting into *{total_parts}* parts …",
-                    parse_mode="Markdown")
-                for i, (data, name, _) in enumerate(parts, 1):
-                    doc = io_module.BytesIO(data)
-                    doc.name = name
-                    part_mb = len(data) / 1024 / 1024
-                    await update.message.reply_document(
-                        document=doc,
-                        caption=f"📦 Part {i}/{total_parts} ({part_mb:.1f} MB)",
-                    )
-                    await asyncio.sleep(1)
-                await _edit(msg,
-                    f"✅ *{total_parts}* parts sent!\n\n"
-                    f"To import: /import → send all parts in order.",
-                    parse_mode="Markdown")
+                await asyncio.sleep(1)
+            await _edit(msg,
+                f"⚠️ Telegram blocked the single {mb:.0f} MB upload — "
+                f"*{total_parts}* parts sent.\n"
+                f"To import: /import → send all parts in order.",
+                parse_mode="Markdown")
         except Exception as e:
             log.error("Export: %s", e, exc_info=True)
             await _edit(msg, f"❌ `{e}`", parse_mode="Markdown")
@@ -1397,6 +1484,127 @@ class SearchBot:
                     f"❌ Errors: *{st['errors']}*\n"
                     f"📊 DB: *{self.db.count():,}*",
                     parse_mode="Markdown")
+
+    # ── /channels ─────────────────────────────────────────────────────────────
+
+    _CHANNELS_MAX_ROWS = 25
+
+    async def _channels_view(self):
+        """
+        Build the /channels panel. Returns (text, keyboard) — the keyboard has
+        a per-channel remove button (per row) plus Refresh. Empty DB returns
+        (text, None) with a hint instead.
+        """
+        overview = await asyncio.to_thread(self.db.channel_overview)
+        if not overview:
+            return ("📭 *No channels indexed yet.*\n"
+                    "Use /index to add one.", None)
+        running = bool(self._monitor and self._monitor.running)
+        lines = [f"📡 *Indexed channels* — *{len(overview)}*"
+                 f" | Monitor: {'▶️ running' if running else '⏹ off'}\n"]
+        buttons = []
+        shown = 0
+        for tid in sorted(overview)[:self._CHANNELS_MAX_ROWS]:
+            e = overview[tid]
+            wm = e.get("watermark")
+            lines.append(
+                f"\n• {_esc(e['name'])}\n"
+                f"  🆔 `{tid}` | 📦 *{e['count']:,}* vectors"
+                + (f" | 💧 watermark msg {wm:,}" if wm is not None else ""))
+            buttons.append([InlineKeyboardButton(
+                f"🗑 {e['name'][:28]}",
+                callback_data=f"chn:rm:{tid}")])
+            shown += 1
+        if len(overview) > shown:
+            lines.append(f"\n… +{len(overview) - shown} more channels "
+                         f"(not listed, already in the buttons)")
+            buttons.extend([
+                [InlineKeyboardButton(f"🗑 Remove {t}", callback_data=f"chn:rm:{t}")]
+                for t in sorted(overview)[shown:]])
+        buttons.append([InlineKeyboardButton("♻️ Refresh", callback_data="chn:refresh")])
+        lines.append("\n🗑 removes a channel: its vectors and monitor "
+                     "watermark are deleted permanently.")
+        return ("\n".join(lines), InlineKeyboardMarkup(buttons))
+
+    async def cmd_channels(self, update: Update, _):
+        if not _admin(update.effective_user.id):
+            return await update.message.reply_text("⛔")
+        try:
+            text, kb = await self._channels_view()
+        except Exception as e:
+            log.error("Channels view: %s", e, exc_info=True)
+            return await update.message.reply_text(f"❌ `{e}`", parse_mode="Markdown")
+        await update.message.reply_text(
+            text, parse_mode="Markdown", reply_markup=kb,
+            disable_web_page_preview=True)
+
+    async def channel_cb(self, update: Update, _):
+        q = update.callback_query
+        await q.answer()
+        if not _admin(q.from_user.id):
+            return
+        parts = (q.data or "").split(":")
+        try:
+            if parts[1] == "rm":
+                tid = int(parts[2])
+                overview = await asyncio.to_thread(self.db.channel_overview)
+                e = overview.get(tid)
+                if not e:
+                    await q.edit_message_text(
+                        "⚠️ Channel no longer present — refreshing panel")
+                    return
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Yes, delete everything",
+                                          callback_data=f"chn:rmOK:{tid}")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data=f"chn:cancel:{tid}")],
+                ])
+                wm = e.get("watermark")
+                await q.edit_message_text(
+                    f"⚠️ *Remove channel?*\n\n"
+                    f"{_esc(e['name'])} (`{tid}`)\n"
+                    f"pack *{e['count']:,}* vectors"
+                    + (f" | 💧 watermark msg {wm:,}" if wm is not None else "") +
+                    "\n\nThis permanently deletes all its vectors from the "
+                    "index and stops the monitor watching it.",
+                    parse_mode="Markdown", reply_markup=kb)
+
+            elif parts[1] == "rmOK":
+                tid = int(parts[2])
+                try:
+                    await q.edit_message_text("🗑 Removing …")
+                    n = await asyncio.to_thread(self.db.forget_channel, tid)
+                except Exception as exc:
+                    log.error("Channel removal %s: %s", tid, exc, exc_info=exc)
+                    await q.edit_message_text(f"❌ `{exc}`", parse_mode="Markdown")
+                    return
+                if self._monitor is not None:
+                    self._monitor.unwatch(tid)
+                bot = q.get_bot()
+                await self._update_pinned_message(bot)
+                text, kb = await self._channels_view()
+                await q.edit_message_text(
+                    f"✅ Removed `{tid}` ({n:,} vectors deleted).\n\n" + text,
+                    parse_mode="Markdown", reply_markup=kb,
+                    disable_web_page_preview=True)
+
+            elif parts[1] == "cancel":
+                text, kb = await self._channels_view()
+                await q.edit_message_text(
+                    text, parse_mode="Markdown", reply_markup=kb,
+                    disable_web_page_preview=True)
+
+            elif parts[1] == "refresh":
+                await q.edit_message_text("♻️ Refreshing …")
+                text, kb = await self._channels_view()
+                await q.edit_message_text(
+                    text, parse_mode="Markdown", reply_markup=kb,
+                    disable_web_page_preview=True)
+        except Exception as e:
+            log.error("Channels callback: %s", e, exc_info=True)
+            try:
+                await q.edit_message_text(f"❌ `{e}`", parse_mode="Markdown")
+            except Exception:
+                pass
 
     # ── /setpinned ────────────────────────────────────────────────────────────
 
@@ -1914,11 +2122,10 @@ class SearchBot:
 
         app.add_handler(CommandHandler("start",         self.cmd_start))
         app.add_handler(CommandHandler("stats",         self.cmd_stats))
-        app.add_handler(CommandHandler("channels",      self.cmd_stats))
+        app.add_handler(CommandHandler("channels",     self.cmd_channels))
         app.add_handler(CommandHandler("status",        self.cmd_stats))
         app.add_handler(CommandHandler("system",        self.cmd_system))
         app.add_handler(CommandHandler("session",       self.cmd_session))
-        app.add_handler(CommandHandler("tune",          self.cmd_tune))
         app.add_handler(CommandHandler("export",        self.cmd_export))
         app.add_handler(CommandHandler("duplicates",    self.cmd_duplicates))
         app.add_handler(CommandHandler("monitor",       self.cmd_monitor))
@@ -1967,11 +2174,25 @@ class SearchBot:
             fallbacks=[CommandHandler("cancel", self.cmd_cancel)],
             conversation_timeout=300,
         ))
+        # /tune: guide → interactive 60 s settings window (plain-text reply),
+        # with the direct-argument form /tune intra=2 batch=8 applying instantly.
+        app.add_handler(ConversationHandler(
+            entry_points=[CommandHandler("tune", self.cmd_tune)],
+            states={
+                TUNE_WAIT: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.tune_input)],
+                ConversationHandler.TIMEOUT: [
+                    MessageHandler(filters.ALL, self.tune_timeout)],
+            },
+            fallbacks=[CommandHandler("cancel", self.cmd_cancel)],
+            conversation_timeout=60,
+        ))
 
         app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CallbackQueryHandler(self.model_cb,   pattern=r"^dl_"))
         app.add_handler(CallbackQueryHandler(self.dup_cb,     pattern=r"^dup_"))
         app.add_handler(CallbackQueryHandler(self.monitor_cb, pattern=r"^mon_"))
+        app.add_handler(CallbackQueryHandler(self.channel_cb, pattern=r"^chn_"))
         app.add_handler(CallbackQueryHandler(self.cleanup_cb, pattern=r"^clean_"))
         app.add_handler(MessageHandler(filters.PHOTO,        self.on_photo))
         app.add_handler(MessageHandler(filters.Document.ALL, self.on_doc))
