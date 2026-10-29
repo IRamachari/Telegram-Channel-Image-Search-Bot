@@ -85,3 +85,6 @@ htmlcov/
 # Logs
 *.log
 logs/
+
+# Single-instance poller lock (see _acquire_single_instance_lock in bot.py)
+bot.lock

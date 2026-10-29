@@ -8,6 +8,7 @@ __pycache__/
 venv/
 chroma_db/
 temp_images/
+bot.lock
 .DS_Store
 *.md
 .vscode/

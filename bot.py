@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 from datetime import datetime
 
@@ -16,7 +17,7 @@ from telegram.ext import (
     ConversationHandler, CallbackQueryHandler,
     ContextTypes, filters,
 )
-from telegram.error import RetryAfter
+from telegram.error import Conflict, RetryAfter
 
 from config import config
 from database import VectorDB
@@ -102,7 +103,57 @@ def _cap_lines(lines: list[str], limit: int) -> list[str]:
 def _admin(uid):
     # Fail closed: an empty ADMIN_IDS used to grant every command — including
     # /login, which rewrites the operator's session file — to every user.
+    # effective_user can be None for channel-post-like contexts; deny those too
+    # instead of raising AttributeError deep inside a handler.
+    if uid is None:
+        return False
     return config.admins_configured and uid in config.ADMIN_IDS
+
+
+def _acquire_single_instance_lock():
+    """
+    Telegram allows exactly ONE getUpdates long-poll per bot token at a time.
+    Start a second poller with the same token and Telegram 409-terminates both
+    processes' polls forever — neither reliably receives updates and the log
+    fills with 'Conflict: terminated by other getUpdates request'.
+
+    This advisory lock refuses to start a second poller from the same project
+    directory. The OS releases it automatically when the holder exits (even on
+    SIGKILL/crash), so a dead bot never blocks the next start. The returned file
+    handle must be kept alive for the whole process lifetime.
+    """
+    import fcntl  # POSIX-only; this bot targets Linux servers / containers
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "bot.lock")
+    try:
+        fh = open(lock_path, "r+")
+    except FileNotFoundError:
+        fh = open(lock_path, "w+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            fh.seek(0)
+            other = (fh.read() or "").strip() or "unknown"
+        except OSError:
+            other = "unknown"
+        log.critical(
+            "REFUSING TO START — another instance of this bot (PID %s) already"
+            " runs from this directory and holds bot.lock. Telegram permits"
+            " only one poller per bot token; a second one causes endless"
+            " '409 Conflict' errors and a bot that never answers commands"
+            " (/index, /model, ...). Find and stop the other process with:"
+            "  ps aux | grep -E 'python.*(main|bot)\\.py' | grep -v grep"
+            "  — then start this one again.", other)
+        raise SystemExit(1)
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"{os.getpid()}\n")
+        fh.flush()
+    except OSError:
+        pass
+    return fh
 
 
 def _esc(value, default: str = "") -> str:
@@ -527,6 +578,11 @@ class SearchBot:
         `update` is None for polling errors and for errors raised in background
         jobs/coroutines, so it must be handled defensively.
         """
+        # 409 Conflict = a second poller owns the token. The poll loser
+        # receives NOTHING — retrying forever just keeps the war alive.
+        if isinstance(ctx.error, Conflict):
+            self._on_conflict()
+            return
         log.error("Handler error: %s", ctx.error, exc_info=ctx.error)
         msg = getattr(update, "effective_message", None) if update is not None else None
         if msg is None:
@@ -545,6 +601,42 @@ class SearchBot:
             await msg.reply_text("⚠️ Something went wrong handling that. Please try again.")
         except Exception:
             pass
+
+    def _on_conflict(self) -> None:
+        """
+        Another poller owns this bot token RIGHT NOW.
+
+        The file lock in run() already refuses a second instance from THIS
+        directory; what is left is a stale process elsewhere (old tmux/screen
+        pane, an auto-restarted systemd/docker copy) or the same token on
+        another machine. A poll loser receives zero updates, so exiting is
+        the only correct action — retrying forever disturbs the winner and
+        floods the log.
+        """
+        if getattr(self, "_conflict_seen", False):
+            return          # already shutting down — log the reason only once
+        self._conflict_seen = True
+        log.critical(
+            "409 Conflict: another process is polling this bot token. This"
+            " instance receives no updates and is exiting. Find the other"
+            " poller with:  ps aux | grep -E 'python.*(main|bot)\\.py' |"
+            " grep -v grep   — also check other servers, tmux/screen panes,"
+            " docker containers and auto-restarting services using the same"
+            " BOT_TOKEN.")
+        try:
+            if self._app is not None and hasattr(self._app, "stop_running"):
+                self._app.stop_running()
+                # Graceful: run_polling() unwinds → post_shutdown runs. Safety
+                # net: if it has not exited within 15 s (a hung task),
+                # hard-exit so this process can never linger as a silent
+                # poll loser that keeps disturbing the winner.
+                timer = threading.Timer(15.0, os._exit, [1])
+                timer.daemon = True
+                timer.start()
+                return
+        except Exception:
+            pass
+        os._exit(1)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -1782,6 +1874,22 @@ class SearchBot:
     # ── run ───────────────────────────────────────────────────────────────────
 
     def run(self):
+        # Fail fast with a CLEAR message instead of an InvalidToken traceback
+        # from deep inside PTB (a missing BOT_TOKEN was an opaque crash).
+        if not config.BOT_TOKEN:
+            log.error("BOT_TOKEN is not set. Put the @BotFather token in "
+                      ".env and restart.")
+            raise SystemExit(1)
+        if not config.admins_configured:
+            # Fail closed: without ADMIN_IDS every admin command (including
+            # /login, which rewrites the session file) is refused for EVERYONE.
+            log.warning("ADMIN_IDS is empty — all admin commands are LOCKED. "
+                        "Set at least one numeric Telegram user id in .env.")
+        # Exactly ONE poller per token per directory. A second instance is the
+        # cause of the endless '409 Conflict: terminated by other getUpdates
+        # request' war, in which neither bot reliably receives updates and
+        # every command (/index, /model, ...) appears broken.
+        self._lock_fh = _acquire_single_instance_lock()
         app = (
             Application.builder()
             .token(config.BOT_TOKEN)
