@@ -1890,9 +1890,20 @@ class SearchBot:
         # request' war, in which neither bot reliably receives updates and
         # every command (/index, /model, ...) appears broken.
         self._lock_fh = _acquire_single_instance_lock()
+        # PTB's default HTTP timeouts are only 5 s (read/connect/write/pool).
+        # On a slow or jittery residential line a perfectly healthy API call
+        # (e.g. the reply to /system) can exceed that and surface as
+        # telegram.error.TimedOut — the user just sees "⚠️ Something went
+        # wrong". Raising the sockets absorbs home-network latency spikes
+        # without masking real outages (the error handler still reports them).
+        # All four builder methods exist since PTB 20.0 (pinned >=20.7).
         app = (
             Application.builder()
             .token(config.BOT_TOKEN)
+            .read_timeout(30)      # API call responses (long replies, edits)
+            .write_timeout(60)     # uploads: /export zips, import media
+            .connect_timeout(30)
+            .pool_timeout(30)
             .post_init(self._on_startup)   # auto-start monitor + sync on every boot
             .post_shutdown(self._on_shutdown)
             .build()
