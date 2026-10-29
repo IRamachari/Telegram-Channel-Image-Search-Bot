@@ -97,6 +97,7 @@ AVAILABLE = {
         "url": "https://huggingface.co/Xenova/siglip-large-patch16-384/resolve/main/onnx/vision_model_quantized.onnx",
         "size_mb": 313.5,
         "size_bytes": 328765816,
+        "sha256": "8cc6badb0f21cf971cab725548a46b3c5ef122583097cc9f6f0bee6921607544",
         "ram_mb": 1400,
         "accuracy": "⭐⭐⭐⭐⭐ Best+",
         "speed": "Slow",
