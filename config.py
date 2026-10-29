@@ -43,6 +43,15 @@ class Config:
     THRESHOLD: float     = float(os.getenv("SIMILARITY_THRESHOLD", "0.85"))
     MAX_RESULTS: int     = int(os.getenv("MAX_RESULTS", "10"))
     PARALLEL_DL: int     = int(os.getenv("PARALLEL_DOWNLOADS", "10"))
+    # Nightly auto-backup (/autobackup). Sends the single-file DB backup to
+    # BACKUP_CHAT_ID (or the first ADMIN_IDS entry) once a day and keeps only
+    # the newest BACKUP_KEEP copies in that chat. BACKUP_HOUR is read in the
+    # SERVER's local timezone.
+    AUTO_BACKUP: bool    = os.getenv(
+        "AUTO_BACKUP", "1") not in ("0", "false", "False", "no", "NO", "off", "OFF", "")
+    BACKUP_CHAT_ID: int  = int(os.getenv("BACKUP_CHAT_ID", "0") or 0)
+    BACKUP_HOUR: int     = int(os.getenv("BACKUP_HOUR", "4") or 0)
+    BACKUP_KEEP: int     = int(os.getenv("BACKUP_KEEP", "7") or 0)
     ADMIN_IDS: list[int] = field(
         default_factory=lambda: _int_list(os.getenv("ADMIN_IDS", ""))
     )

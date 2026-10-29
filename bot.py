@@ -716,6 +716,7 @@ class SearchBot:
             f"/cleanup — remove deleted vectors\n"
             f"/duplicates — find duplicates\n"
             f"/export — download DB (single file)\n"
+            f"/autobackup — nightly DB backup (on/off/now)\n"
             f"/import — upload DB\n"
             f"/tune — tuning guide + override\n"
             f"/system — server stats\n"
@@ -1188,6 +1189,153 @@ class SearchBot:
         except Exception as e:
             log.error("Export: %s", e, exc_info=True)
             await _edit(msg, f"❌ `{e}`", parse_mode="Markdown")
+
+    # ── /autobackup — nightly one-file backup ─────────────────────────────────
+
+    _AUTOBACKUP_JOB_NAME = "auto_backup"
+
+    def _backup_cfg(self) -> dict:
+        enabled = _state.get("autobackup.enabled", None)
+        if enabled is None:
+            enabled = bool(config.AUTO_BACKUP)
+        sent = _state.get("autobackup.sent", [])
+        if not isinstance(sent, list):
+            sent = []
+        return {"enabled": bool(enabled), "sent": sent}
+
+    async def _build_backup(self):
+        """
+        Build the single-file backup zip. Same ritual as /export: built under
+        the DB write lock so a page captured mid-transaction can never land in
+        the archive (a silently corrupt backup only fails at /import time).
+        """
+        from db_manager import export_db_single
+        async with self._db_lock:
+            return await asyncio.to_thread(export_db_single, self.db)
+
+    async def _deliver_backup(self, target: int, data: bytes, name: str,
+                              caption: str):
+        """Send one backup file to chat `target`; returns (message_id, mode)."""
+        if len(data) <= self._HTTP_UPLOAD_SAFE:
+            doc = io_module.BytesIO(data)
+            doc.name = name
+            m = await self._app.bot.send_document(
+                chat_id=target, document=doc, caption=caption)
+            return m.message_id, "api"
+        client = await self._get_mtproto()
+        if client is None:
+            raise RuntimeError(
+                "backup exceeds the Bot API limit and no MTProto client is "
+                "available (set TELEGRAM_API_ID and TELEGRAM_API_HASH)")
+        peer = await self._resolve_mtproto_peer(client, target)
+        tmpdir = tempfile.mkdtemp(prefix="bkp_", dir=config.TEMP_DIR)
+        try:
+            tmp = Path(tmpdir) / name
+            tmp.write_bytes(data)
+            sent = await client.send_file(
+                peer, str(tmp), caption=caption, force_document=True)
+            return int(getattr(sent, "id", 0) or 0), "mtproto"
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    async def _delete_backup_messages(self, entries):
+        """Best-effort deletion of superseded backup messages."""
+        for chat_id, mid, mode in entries:
+            try:
+                if mode == "api":
+                    await self._app.bot.delete_message(
+                        chat_id=chat_id, message_id=mid)
+                else:
+                    client = await self._get_mtproto()
+                    if client is not None:
+                        peer = await self._resolve_mtproto_peer(client, chat_id)
+                        await client.delete_messages(peer, [mid])
+            except Exception as e:
+                log.debug("Auto-backup cleanup: %s", e)
+
+    async def _run_backup(self, target: int) -> str:
+        """Build, deliver, record and prune one automatic backup."""
+        if self.db.count() == 0:
+            return "❌ Empty DB — nothing to back up."
+        data, name, stats = await self._build_backup()
+        mb = len(data) / 1024 / 1024
+        n_ch = len(await asyncio.to_thread(self.db.list_channels))
+        caption = (f"🗄 Auto backup {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+                   f"{n_ch} channels · "
+                   f"{stats['vectors']:,} vectors · {mb:.1f} MB")
+        mid, mode = await self._deliver_backup(target, data, name, caption)
+        cfg = self._backup_cfg()
+        cfg["sent"].append([target, mid, mode])
+        keep = max(1, config.BACKUP_KEEP)
+        doomed = cfg["sent"][:-keep]
+        cfg["sent"] = cfg["sent"][-keep:]
+        _state.put("autobackup.sent", cfg["sent"])
+        await self._delete_backup_messages(doomed)
+        kept = len(cfg["sent"])
+        return (f"✅ Backup sent ({mb:.1f} MB, {'Bot API' if mode == 'api' else 'MTProto'}) —\n"
+                f"{stats['vectors']:,} vectors, {n_ch} channels.\n"
+                f"Keeping the newest {min(keep, kept)} backup(s).")
+
+    async def _auto_backup_job(self, ctx: ContextTypes.DEFAULT_TYPE):
+        cfg = self._backup_cfg()
+        if not cfg["enabled"]:
+            return
+        if not config.BACKUP_CHAT_ID and not config.admins_configured:
+            log.warning("Auto-backup skipped: set BACKUP_CHAT_ID or ADMIN_IDS "
+                        "in .env so the backup has somewhere to go.")
+            return
+        target = config.BACKUP_CHAT_ID or config.ADMIN_IDS[0]
+        try:
+            text = await self._run_backup(target)
+            log.info("Auto-backup: %s", text.replace("\n", " | "))
+        except Exception as e:
+            log.error("Auto-backup failed: %s", e, exc_info=True)
+
+    async def cmd_autobackup(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not _admin(update.effective_user.id):
+            return await update.message.reply_text("⛔")
+        args = (update.message.text or "").split()[1:]
+        arg0 = args[0].lower() if args else ""
+        if arg0 == "on":
+            _state.put("autobackup.enabled", True)
+            return await update.message.reply_text(
+                "✅ Auto-backup enabled.", parse_mode="Markdown")
+        if arg0 == "off":
+            _state.put("autobackup.enabled", False)
+            return await update.message.reply_text(
+                "⏹ Auto-backup disabled.", parse_mode="Markdown")
+        if arg0 == "now":
+            msg = await update.message.reply_text("📦 Preparing backup …")
+            try:
+                text = await self._run_backup(update.effective_chat.id)
+                await _edit(msg, text, parse_mode="Markdown")
+            except Exception as e:
+                log.error("Autobackup now: %s", e, exc_info=True)
+                await _edit(msg, f"❌ `{e}`", parse_mode="Markdown")
+            return
+        cfg = self._backup_cfg()
+        tag = "✅ enabled" if cfg["enabled"] else "⏹ disabled"
+        target = config.BACKUP_CHAT_ID or (
+            config.ADMIN_IDS[0] if config.ADMIN_IDS else 0)
+        nxt = "—"
+        try:
+            jq = getattr(self._app, "job_queue", None) if self._app else None
+            jobs = jq.get_jobs_by_name(self._AUTOBACKUP_JOB_NAME) if jq else []
+            if jobs and getattr(jobs[0], "next_t", None):
+                nxt = jobs[0].next_t.isoformat(sep=" ", timespec="minutes")
+        except Exception:
+            pass
+        await update.message.reply_text(
+            f"🗄 *Auto-backup*\n"
+            f"Status: {tag}\n"
+            f"Schedule: daily at `{max(0, min(23, config.BACKUP_HOUR)):02d}:00` "
+            f"(server time)\n"
+            f"Target: `{target or 'unset'}`\n"
+            f"Kept copies: {config.BACKUP_KEEP}\n"
+            f"Next run: `{nxt}`\n\n"
+            f"`/autobackup now` — run immediately (back here)\n"
+            f"`/autobackup on|off` — enable/disable",
+            parse_mode="Markdown")
 
     # ── /import ───────────────────────────────────────────────────────────────
 
@@ -2050,6 +2198,10 @@ class SearchBot:
             return await _edit(msg, f"⚠️ Download failed: `{e}`", parse_mode="Markdown")
         try:
             hits = await asyncio.to_thread(self.searcher.duplicates, data=data)
+            if not hits:
+                # No near-duplicate above THRESHOLD — still show the closest
+                # matches so a first sighting of an image is never a dead end.
+                hits = await asyncio.to_thread(self.searcher.search, data=data, n=8)
             await _edit(msg, _fmt(hits), parse_mode="Markdown", disable_web_page_preview=True)
         except Exception as e:
             await _edit(msg, f"⚠️ `{e}`", parse_mode="Markdown")
@@ -2075,6 +2227,10 @@ class SearchBot:
             return await _edit(msg, f"⚠️ Download failed: `{e}`", parse_mode="Markdown")
         try:
             hits = await asyncio.to_thread(self.searcher.duplicates, data=data)
+            if not hits:
+                # No near-duplicate above THRESHOLD — still show the closest
+                # matches so a first sighting of an image is never a dead end.
+                hits = await asyncio.to_thread(self.searcher.search, data=data, n=8)
             await _edit(msg, _fmt(hits), parse_mode="Markdown", disable_web_page_preview=True)
         except Exception as e:
             await _edit(msg, f"⚠️ `{e}`", parse_mode="Markdown")
@@ -2127,6 +2283,7 @@ class SearchBot:
         app.add_handler(CommandHandler("system",        self.cmd_system))
         app.add_handler(CommandHandler("session",       self.cmd_session))
         app.add_handler(CommandHandler("export",        self.cmd_export))
+        app.add_handler(CommandHandler("autobackup",    self.cmd_autobackup))
         app.add_handler(CommandHandler("duplicates",    self.cmd_duplicates))
         app.add_handler(CommandHandler("monitor",       self.cmd_monitor))
         app.add_handler(CommandHandler("cleanup",       self.cmd_cleanup))
@@ -2197,6 +2354,24 @@ class SearchBot:
         app.add_handler(MessageHandler(filters.PHOTO,        self.on_photo))
         app.add_handler(MessageHandler(filters.Document.ALL, self.on_doc))
         app.add_handler(CommandHandler("cancel", self.cmd_cancel))
+
+        # Nightly auto-backup (feature 10). Needs the job-queue extra.
+        if getattr(app, "job_queue", None) is None:
+            log.warning("Auto-backup unavailable: reinstall with "
+                        "'pip install \"python-telegram-bot[job-queue]\"'.")
+        else:
+            try:
+                import datetime as _dtmod
+                hour = max(0, min(23, int(config.BACKUP_HOUR)))
+                local_tz = datetime.now().astimezone().tzinfo
+                app.job_queue.run_daily(
+                    self._auto_backup_job,
+                    time=_dtmod.time(hour=hour, tzinfo=local_tz),
+                    name=self._AUTOBACKUP_JOB_NAME)
+                log.info("Auto-backup scheduled daily at %02d:00 (server time).",
+                         hour)
+            except Exception as e:
+                log.warning("Could not schedule auto-backup: %s", e)
 
         log.info("Bot polling …")
         # timeout=30 raises the long-poll window (default 10). PTB derives the
