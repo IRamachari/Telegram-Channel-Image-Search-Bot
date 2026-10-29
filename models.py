@@ -7,6 +7,7 @@ import shutil
 import time
 import urllib.error
 import urllib.request
+import http.client
 from pathlib import Path
 
 from config import config
@@ -207,6 +208,11 @@ def model_file_size_mb() -> float:
 MIN_MODEL_BYTES = 1024 * 1024
 _CHUNK = 256 * 1024
 _TIMEOUT = 30
+# A connection that goes completely silent for this long is dead — the 30 s
+# socket timeout already raises for a hung read, but a server trickling a few
+# bytes every 20 s would sit under it forever.
+_STALL_SECS = 45
+_RETRIES = 2
 
 
 def _sha256_of(path: Path) -> str:
@@ -240,7 +246,13 @@ def _resume_download(url: str, dest: Path, expected: int, progress=None) -> None
         have = 0
     if expected and have == expected:
         return                      # already complete — the caller verifies it
-    deadline = time.monotonic() + 600  # 10 min overall budget
+    # Overall budget scales with the file size so a genuinely slow line can
+    # still finish: assume ~100 KB/s worst case with 2x headroom. The stall
+    # clock below is what actually kills a hung connection on a fast line.
+    slow_floor = 100 * 1024
+    budget = max(600.0, expected / slow_floor * 2) if expected else 600.0
+    overall = time.monotonic() + budget
+    stall = time.monotonic() + _STALL_SECS
     req = urllib.request.Request(url)
     if have:
         req.add_header("Range", f"bytes={have}-")
@@ -261,13 +273,19 @@ def _resume_download(url: str, dest: Path, expected: int, progress=None) -> None
         with open(dest, "ab" if have else "wb") as fh:
             done = have
             while True:
-                if time.monotonic() > deadline:
-                    raise RuntimeError("download deadline exceeded")
+                now = time.monotonic()
+                if now > overall:
+                    raise RuntimeError(
+                        f"download exceeded a {int(budget / 60)}-minute budget")
+                if now > stall:
+                    raise RuntimeError(
+                        f"download stalled: no bytes for {_STALL_SECS} s")
                 chunk = resp.read(_CHUNK)
                 if not chunk:
                     break
                 fh.write(chunk)
                 done += len(chunk)
+                stall = time.monotonic() + _STALL_SECS   # data still flowing
                 if progress is not None:
                     try:
                         progress(done, total)
@@ -340,23 +358,33 @@ def download_model(key: str, progress=None) -> str:
                 f"Not enough disk space: need ~{expected / 1048576:.0f} MB, "
                 f"have {free / 1048576:.0f} MB free")
     log.info("Downloading %s from %s", info["name"], info["url"])
-    try:
-        _resume_download(info["url"], tmp, expected, progress)
-        check = verify_model(tmp, key=key)
-        if not check["ok"]:
-            if (check["size_bytes"] and check["expected_bytes"]
-                    and check["size_bytes"] < check["expected_bytes"]):
-                # Truncated: keep it, the next call resumes from here.
-                raise RuntimeError(
-                    f"incomplete download ({check['size_bytes']} of "
-                    f"{check['expected_bytes']} bytes) — run again to resume")
-            tmp.unlink(missing_ok=True)
-            raise RuntimeError(check["reason"])
-        # Never leave the previous model deleted while the new one is unproven:
-        # the old code removed it first, leaving a window with no model at all.
-        os.replace(tmp, str(ONNX_PATH))
-    except Exception as exc:
-        raise RuntimeError(f"Download failed: {exc}")
+    for attempt in range(1, _RETRIES + 1):
+        try:
+            _resume_download(info["url"], tmp, expected, progress)
+        except (urllib.error.URLError, http.client.HTTPException,
+                TimeoutError, ConnectionError, RuntimeError) as exc:
+            # Transient network trouble. The .part file survives, so the next
+            # attempt (or the user's next /model) continues where it left off.
+            if attempt >= _RETRIES:
+                raise RuntimeError(f"Download failed: {exc}") from exc
+            log.warning("Download attempt %d/%d failed: %s — retrying",
+                        attempt, _RETRIES, exc)
+            time.sleep(min(15, 5 * attempt))
+            continue
+        break
+    check = verify_model(tmp, key=key)
+    if not check["ok"]:
+        if (check["size_bytes"] and check["expected_bytes"]
+                and check["size_bytes"] < check["expected_bytes"]):
+            # Truncated: keep it, the next call resumes from here.
+            raise RuntimeError(
+                f"incomplete download ({check['size_bytes']} of "
+                f"{check['expected_bytes']} bytes) — run again to resume")
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(check["reason"])
+    # Never leave the previous model deleted while the new one is unproven:
+    # the old code removed it first, leaving a window with no model at all.
+    os.replace(tmp, str(ONNX_PATH))
     set_active_model(key)
     write_model_fingerprint()
     size = model_file_size_mb()
