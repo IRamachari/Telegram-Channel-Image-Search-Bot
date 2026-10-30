@@ -28,6 +28,7 @@ from searcher import ImageSearcher
 import models
 import system_info
 import state as _state
+from media import MIN_PHOTO_SIZE
 
 log = logging.getLogger(__name__)
 
@@ -166,6 +167,26 @@ def _esc(value, default: str = "") -> str:
         return escape_markdown(str(value if value not in (None, "") else default), version=1)
     except Exception:
         return str(value)
+
+
+def _pick_query_photo(photo):
+    """
+    Query-side twin of ``media.pick_photo_size``.
+
+    The indexer embeds the SMALLEST PhotoSize that is still >= MIN_PHOTO_SIZE
+    (normally 320 px), not the largest — embedding the same resolution at query
+    time keeps the vectors comparable instead of comparing a 320 px thumbnail
+    against a 1280 px original.
+    """
+    usable = [p for p in (photo or [])
+              if max(getattr(p, "width", 0), getattr(p, "height", 0)) > 0]
+    if not usable:
+        return None
+    usable.sort(key=lambda p: max(p.width, p.height))
+    for p in usable:
+        if max(p.width, p.height) >= MIN_PHOTO_SIZE:
+            return p
+    return usable[-1]
 
 
 def _fmt(hits):
@@ -2187,10 +2208,17 @@ class SearchBot:
     # ── photo / doc ───────────────────────────────────────────────────────────
 
     async def on_photo(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        # Personal bot: the index links to PRIVATE channels. Without this gate
+        # any stranger who finds the bot could search the owner's index.
+        if not _admin(update.effective_user.id):
+            log.debug("Ignoring photo from non-admin %s", update.effective_user.id)
+            return
         if not self.embedder.is_ready():
             return await update.message.reply_text("❌ /model first")
         msg = await update.message.reply_text("🔍 …")
-        photo = update.message.photo[-1]
+        photo = _pick_query_photo(update.message.photo)
+        if photo is None:
+            return await _edit(msg, "⚠️ No usable photo size.", parse_mode="Markdown")
         try:
             data = await self._fetch_media_bytes(
                 update, ctx, photo.file_id, size_bytes=getattr(photo, "file_size", 0) or 0)
@@ -2207,7 +2235,14 @@ class SearchBot:
             await _edit(msg, f"⚠️ `{e}`", parse_mode="Markdown")
 
     async def on_doc(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not _admin(update.effective_user.id):
+            log.debug("Ignoring document from non-admin %s", update.effective_user.id)
+            return
         doc = update.message.document
+        # An animation (GIF) carries BOTH .animation and .document. on_video
+        # already answered it, so bailing out here prevents a double reply.
+        if getattr(update.message, "animation", None) is not None:
+            return
         # Some uploads carry no mime_type at all — fall back to the filename
         # extension so a photo sent as a file is still searchable.
         name = (doc.file_name or "").lower()
@@ -2216,9 +2251,12 @@ class SearchBot:
                                        ".bmp", ".gif", ".tiff", ".tif",
                                        ".heic", ".heif")))
         if not is_image_doc:
-            # A video sent as a FILE is indexed by its poster thumbnail, so
-            # searching it must use the same frame instead of ignoring it.
-            if (doc.mime_type or "").startswith("video/"):
+            mime = (doc.mime_type or "").strip().lower()
+            # Videos sent as FILES — and unknown-mime documents, which the
+            # indexer embeds as poster frames (media._document_kind) — must be
+            # searched through that same frame instead of being ignored.
+            if (mime.startswith("video/")
+                    or (not mime and getattr(doc, "thumbnail", None))):
                 if not self.embedder.is_ready():
                     return await update.message.reply_text("❌ /model first")
                 thumb = getattr(doc, "thumbnail", None)
@@ -2270,6 +2308,9 @@ class SearchBot:
 
     async def on_video(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """Search a native video / GIF / round video note by its poster frame."""
+        if not _admin(update.effective_user.id):
+            log.debug("Ignoring video from non-admin %s", update.effective_user.id)
+            return
         m = update.message
         media = m.video or m.animation or m.video_note
         if media is None:
