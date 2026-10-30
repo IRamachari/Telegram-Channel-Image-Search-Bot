@@ -707,7 +707,7 @@ class SearchBot:
             f"*Status:*\n  Session: {s}\n  Model: {m} (`{a}`)\n"
             f"  Database: *{n:,}* vectors\n  Monitor: {mon}\n\n"
             f"*Setup:* /login → /model → /index\n"
-            f"*Search:* Send photo\n\n"
+            f"*Search:* Send photo or video\n\n"
             f"*Tools:*\n"
             f"/monitor — monitor status / toggle\n"
             f"/checkupdates — sync new images now\n"
@@ -2216,6 +2216,17 @@ class SearchBot:
                                        ".bmp", ".gif", ".tiff", ".tif",
                                        ".heic", ".heif")))
         if not is_image_doc:
+            # A video sent as a FILE is indexed by its poster thumbnail, so
+            # searching it must use the same frame instead of ignoring it.
+            if (doc.mime_type or "").startswith("video/"):
+                if not self.embedder.is_ready():
+                    return await update.message.reply_text("❌ /model first")
+                thumb = getattr(doc, "thumbnail", None)
+                if thumb is None:
+                    return await update.message.reply_text(
+                        "⚠️ This video has no thumbnail to search.")
+                msg = await update.message.reply_text("🔍 …")
+                return await self._search_thumb(ctx, thumb, msg)
             return
         if not self.embedder.is_ready():
             return await update.message.reply_text("❌ /model first")
@@ -2234,6 +2245,44 @@ class SearchBot:
             await _edit(msg, _fmt(hits), parse_mode="Markdown", disable_web_page_preview=True)
         except Exception as e:
             await _edit(msg, f"⚠️ `{e}`", parse_mode="Markdown")
+
+    async def _search_thumb(self, ctx: ContextTypes.DEFAULT_TYPE, thumb, msg):
+        """
+        Embed a video/GIF poster thumbnail and answer with matches.
+
+        Channel indexing embeds the poster frame of videos (``media_kind`` ==
+        "thumb"), so a video sent to the bot has to be searched through that
+        same frame — otherwise the query vector and the indexed vectors come
+        from different pixels and never match.
+        """
+        try:
+            f = await ctx.bot.get_file(thumb.file_id)
+            data = bytes(await f.download_as_bytearray())
+        except Exception as e:
+            return await _edit(msg, f"⚠️ Download failed: `{e}`", parse_mode="Markdown")
+        try:
+            hits = await asyncio.to_thread(self.searcher.duplicates, data=data)
+            if not hits:
+                hits = await asyncio.to_thread(self.searcher.search, data=data, n=8)
+            await _edit(msg, _fmt(hits), parse_mode="Markdown", disable_web_page_preview=True)
+        except Exception as e:
+            await _edit(msg, f"⚠️ `{e}`", parse_mode="Markdown")
+
+    async def on_video(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Search a native video / GIF / round video note by its poster frame."""
+        m = update.message
+        media = m.video or m.animation or m.video_note
+        if media is None:
+            return
+        if not self.embedder.is_ready():
+            return await m.reply_text("❌ /model first")
+        thumb = getattr(media, "thumbnail", None)
+        if thumb is None:
+            return await m.reply_text(
+                "⚠️ This video has no thumbnail — nothing to match against.\n"
+                "Only videos with a poster frame are searchable.")
+        msg = await m.reply_text("🔍 …")
+        await self._search_thumb(ctx, thumb, msg)
 
     # ── run ───────────────────────────────────────────────────────────────────
 
@@ -2352,6 +2401,8 @@ class SearchBot:
         app.add_handler(CallbackQueryHandler(self.channel_cb, pattern=r"^chn_"))
         app.add_handler(CallbackQueryHandler(self.cleanup_cb, pattern=r"^clean_"))
         app.add_handler(MessageHandler(filters.PHOTO,        self.on_photo))
+        app.add_handler(MessageHandler(filters.VIDEO | filters.ANIMATION |
+                                       filters.VIDEO_NOTE, self.on_video))
         app.add_handler(MessageHandler(filters.Document.ALL, self.on_doc))
         app.add_handler(CommandHandler("cancel", self.cmd_cancel))
 
