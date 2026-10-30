@@ -114,6 +114,50 @@ def _admin(uid):
     return config.admins_configured and uid in config.ADMIN_IDS
 
 
+# Non-admin users granted search access with /adduser. Persisted in the same
+# JSON state file as the auto-backup settings so grants survive restarts.
+_ALLOWED_KEY = "allowed_users"
+
+
+def _allowed_users() -> dict[int, str]:
+    """``{user_id: label}`` of users explicitly allowed to use the bot."""
+    raw = _state.get(_ALLOWED_KEY, {})
+    out: dict[int, str] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                out[int(k)] = str(v)
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def _allowed(uid) -> bool:
+    """Admins always pass; everyone else needs an /adduser grant."""
+    if uid is None:
+        return False
+    return _admin(uid) or uid in _allowed_users()
+
+
+def _user_arg(update, ctx) -> tuple[int | None, str]:
+    """(user_id, label) from a replied-to message or a numeric argument."""
+    rt = getattr(update.message, "reply_to_message", None)
+    u = getattr(rt, "from_user", None) if rt is not None else None
+    if u is not None:
+        if getattr(u, "is_bot", False):
+            return None, ""          # never grant access to a bot account
+        label = f"@{u.username}" if getattr(u, "username", None) else (
+            getattr(u, "full_name", "") or "")
+        return int(u.id), label
+    args = getattr(ctx, "args", None) or []
+    if args:
+        try:
+            return int(str(args[0]).lstrip("@")), " ".join(args[1:])[:64]
+        except ValueError:
+            return None, ""
+    return None, ""
+
+
 def _acquire_single_instance_lock():
     """
     Telegram allows exactly ONE getUpdates long-poll per bot token at a time.
@@ -717,33 +761,105 @@ class SearchBot:
     # ── /start ────────────────────────────────────────────────────────────────
 
     async def cmd_start(self, update: Update, _):
+        uid = update.effective_user.id if update.effective_user else None
+        if not _allowed(uid):
+            if uid is None:
+                return await update.message.reply_text("⛔ Not authorised.")
+            return await update.message.reply_text(
+                f"⛔ Not authorised.\nYour ID: `{uid}`\n"
+                f"Ask the admin to run `/adduser {uid}`.",
+                parse_mode="Markdown")
         from indexer import session_exists
         s = "✅" if session_exists() else "❌ → /login"
         m = "✅" if self.embedder.is_ready() else "❌ → /model"
         a = models.get_active_model() or "none"
         n = self.db.count()
         mon = "✅ Running" if self._monitor and self._monitor.running else "⏹ Off"
+        tools = ""
+        if _admin(uid):
+            tools = (
+                "*Tools:*\n"
+                "/monitor — monitor status / toggle\n"
+                "/checkupdates — sync new images now\n"
+                "/channels — manage indexed channels\n"
+                "/setpinned — pin live status message\n"
+                "/cleanup — remove deleted vectors\n"
+                "/duplicates — find duplicates\n"
+                "/export — download DB (single file)\n"
+                "/autobackup — nightly DB backup (on/off/now)\n"
+                "/import — upload DB\n"
+                "/tune — tuning guide + override\n"
+                "/adduser — allow a user to search\n"
+                "/deluser — revoke a user's access\n"
+                "/users — list allowed users\n"
+                "/system — server stats\n"
+                "/stats — DB stats")
         await update.message.reply_text(
             f"🔍 *Image Search Bot*\n\n"
             f"*Status:*\n  Session: {s}\n  Model: {m} (`{a}`)\n"
             f"  Database: *{n:,}* vectors\n  Monitor: {mon}\n\n"
             f"*Setup:* /login → /model → /index\n"
-            f"*Search:* Send photo or video\n\n"
-            f"*Tools:*\n"
-            f"/monitor — monitor status / toggle\n"
-            f"/checkupdates — sync new images now\n"
-            f"/channels — manage indexed channels\n"
-            f"/setpinned — pin live status message\n"
-            f"/cleanup — remove deleted vectors\n"
-            f"/duplicates — find duplicates\n"
-            f"/export — download DB (single file)\n"
-            f"/autobackup — nightly DB backup (on/off/now)\n"
-            f"/import — upload DB\n"
-            f"/tune — tuning guide + override\n"
-            f"/system — server stats\n"
-            f"/stats — DB stats",
+            f"*Search:* Send photo or video\n\n" + tools,
             parse_mode="Markdown",
         )
+
+    # ── /adduser /deluser /users ──────────────────────────────────────────────
+
+    async def cmd_adduser(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not _admin(update.effective_user.id):
+            return await update.message.reply_text("⛔")
+        target_id, label = _user_arg(update, ctx)
+        if target_id is None:
+            return await update.message.reply_text(
+                "Usage: `/adduser <user_id>`\n"
+                "Or reply to that user's message with /adduser.\n"
+                "A user can see their own ID by sending /start to the bot.",
+                parse_mode="Markdown")
+        if _admin(target_id):
+            return await update.message.reply_text(
+                f"ℹ️ `{target_id}` is already an admin.", parse_mode="Markdown")
+        users = _allowed_users()
+        users[target_id] = label
+        _state.put(_ALLOWED_KEY, {str(k): v for k, v in users.items()})
+        extra = f" ({label})" if label else ""
+        await update.message.reply_text(
+            f"✅ Allowed `{target_id}`{extra} to use the bot.\n"
+            f"They can now send photos or videos to search.",
+            parse_mode="Markdown")
+
+    async def cmd_deluser(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not _admin(update.effective_user.id):
+            return await update.message.reply_text("⛔")
+        target_id, _label = _user_arg(update, ctx)
+        if target_id is None:
+            return await update.message.reply_text(
+                "Usage: `/deluser <user_id>` (or reply to their message)",
+                parse_mode="Markdown")
+        users = _allowed_users()
+        if target_id not in users:
+            return await update.message.reply_text(
+                f"ℹ️ `{target_id}` has no /adduser grant.", parse_mode="Markdown")
+        users.pop(target_id)
+        _state.put(_ALLOWED_KEY, {str(k): v for k, v in users.items()})
+        await update.message.reply_text(
+            f"✅ Revoked access for `{target_id}`.", parse_mode="Markdown")
+
+    async def cmd_users(self, update: Update, _):
+        if not _admin(update.effective_user.id):
+            return await update.message.reply_text("⛔")
+        admins = sorted(config.ADMIN_IDS)
+        users = _allowed_users()
+        lines = ["👥 Bot access", "", "Admins:"]
+        lines += [f"  {a}" for a in admins] or ["  (none configured)"]
+        lines += ["", "Allowed users (search only):"]
+        if users:
+            for uid, label in sorted(users.items()):
+                lines.append(f"  {uid}" + (f" — {label}" if label else ""))
+        else:
+            lines.append("  (none — use /adduser <id>)")
+        # Plain text on purpose: labels are user-controlled and may contain
+        # Markdown metacharacters that would make the reply fail to parse.
+        await update.message.reply_text("\n".join(lines))
 
     # ── /session ──────────────────────────────────────────────────────────────
 
@@ -2210,8 +2326,8 @@ class SearchBot:
     async def on_photo(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Personal bot: the index links to PRIVATE channels. Without this gate
         # any stranger who finds the bot could search the owner's index.
-        if not _admin(update.effective_user.id):
-            log.debug("Ignoring photo from non-admin %s", update.effective_user.id)
+        if not _allowed(update.effective_user.id):
+            log.debug("Ignoring photo from non-allowed %s", update.effective_user.id)
             return
         if not self.embedder.is_ready():
             return await update.message.reply_text("❌ /model first")
@@ -2235,8 +2351,8 @@ class SearchBot:
             await _edit(msg, f"⚠️ `{e}`", parse_mode="Markdown")
 
     async def on_doc(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if not _admin(update.effective_user.id):
-            log.debug("Ignoring document from non-admin %s", update.effective_user.id)
+        if not _allowed(update.effective_user.id):
+            log.debug("Ignoring document from non-allowed %s", update.effective_user.id)
             return
         doc = update.message.document
         # An animation (GIF) carries BOTH .animation and .document. on_video
@@ -2308,8 +2424,8 @@ class SearchBot:
 
     async def on_video(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """Search a native video / GIF / round video note by its poster frame."""
-        if not _admin(update.effective_user.id):
-            log.debug("Ignoring video from non-admin %s", update.effective_user.id)
+        if not _allowed(update.effective_user.id):
+            log.debug("Ignoring video from non-allowed %s", update.effective_user.id)
             return
         m = update.message
         media = m.video or m.animation or m.video_note
@@ -2369,6 +2485,9 @@ class SearchBot:
         app.add_handler(CommandHandler("start",         self.cmd_start))
         app.add_handler(CommandHandler("stats",         self.cmd_stats))
         app.add_handler(CommandHandler("channels",     self.cmd_channels))
+        app.add_handler(CommandHandler("adduser",      self.cmd_adduser))
+        app.add_handler(CommandHandler("deluser",      self.cmd_deluser))
+        app.add_handler(CommandHandler("users",        self.cmd_users))
         app.add_handler(CommandHandler("status",        self.cmd_stats))
         app.add_handler(CommandHandler("system",        self.cmd_system))
         app.add_handler(CommandHandler("session",       self.cmd_session))
